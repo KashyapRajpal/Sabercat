@@ -1,0 +1,61 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+name: Beta feedback
+description: Tell us how the beta went, including what worked and what was confusing
+title: "[Beta feedback]: "
+labels: ["feedback", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the beta. Any feedback helps, including "it worked fine".
+        Problems that break something are better filed with the "Bug report" template.
+  - type: input
+    id: version
+    attributes:
+      label: Sabercat version
+      description: Shown in the window title and in Help > About, for example 1.0.0-beta.1.
+      placeholder: 1.0.0-beta.1
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: The things you did with Sabercat during the beta.
+    validations:
+      required: true
+  - type: textarea
+    id: worked
+    attributes:
+      label: What worked well
+  - type: textarea
+    id: confusing
+    attributes:
+      label: What was confusing or missing
+      description: Anything you had to guess at, or wanted and could not find.
+  - type: checkboxes
+    id: scene-types
+    attributes:
+      label: Scene types used
+      description: Tick every format you opened.
+      options:
+        - label: PLY (.ply)
+        - label: SPZ (.spz)
+        - label: .splat
+        - label: .ksplat
+        - label: SOG (.sog)
+        - label: glTF / GLB (.glb)
+        - label: Sabercat project (.sabercat)
+  - type: textarea
+    id: performance
+    attributes:
+      label: Performance notes
+      description: Approximate splat count, GPU, frame rate or how long loading took. Rough numbers are fine.
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System info (optional)
+      description: In Sabercat, open Help > About and click "Copy system info", then paste the text here if it helps.
+      render: text

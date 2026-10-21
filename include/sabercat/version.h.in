@@ -1,0 +1,27 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// The Sabercat release version. This file is a template: CMake generates
+// build/include/sabercat/version.h from it (configure_file in the root
+// CMakeLists.txt) and installs that generated header. Edit the project()
+// VERSION there, not here.
+#pragma once
+
+#define SABERCAT_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define SABERCAT_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define SABERCAT_VERSION_PATCH @PROJECT_VERSION_PATCH@
+// The full version string: "<major>.<minor>.<patch>", plus "-<suffix>" for a
+// pre-release build (CMake cache variable SABERCAT_VERSION_SUFFIX, e.g. beta.1).
+#define SABERCAT_VERSION_STRING "@SABERCAT_VERSION_STRING@"
+// The pre-release suffix alone; "" for a release build.
+#define SABERCAT_VERSION_SUFFIX "@SABERCAT_VERSION_SUFFIX@"
+// Short git commit of the source tree at configure time; "unknown" when git
+// was not found.
+#define SABERCAT_GIT_SHA "@SABERCAT_GIT_SHA@"
+
+namespace sabercat
+{
+
+inline constexpr const char * kVersionString = SABERCAT_VERSION_STRING;
+
+} // namespace sabercat

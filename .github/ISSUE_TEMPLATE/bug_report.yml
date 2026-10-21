@@ -1,0 +1,66 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+name: Bug report
+description: Something crashes, renders wrongly, or does not behave as documented
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. The system info and the
+        log file make most bugs reproducible, so please include both.
+  - type: input
+    id: version
+    attributes:
+      label: Sabercat version
+      description: Shown in the window title and in Help > About, for example 1.0.0-beta.1.
+      placeholder: 1.0.0-beta.1
+    validations:
+      required: true
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System info
+      description: In Sabercat, open Help > About and click "Copy system info", then paste the text here.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you thought would happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Include any error text or a screenshot.
+    validations:
+      required: true
+  - type: textarea
+    id: scene
+    attributes:
+      label: Scene
+      description: The scene format (.ply, .spz, .splat, .ksplat, .sog, .glb), its size if you know it, and whether it can be shared. Leave blank if the problem does not depend on a scene.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: >-
+        Attach the newest file from %LOCALAPPDATA%\Sabercat\logs (drag it into this box).
+        Open that folder from Help > About > Open logs folder. If you ran with --no-log,
+        say so here.

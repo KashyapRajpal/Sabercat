@@ -1,0 +1,128 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef SABERCAT_RELIGHT_COMMON_SLANGH
+#define SABERCAT_RELIGHT_COMMON_SLANGH
+
+// Shared by relight_prepare, gbuffer_rasterize and
+// deferred_lighting. Host mirrors live in src/renderer/relight_pass.cpp with
+// static_asserts on size.
+
+#include "config.slangh"
+
+static const float kPi = 3.14159265358979f;
+
+// One light, std430 (80 B). Packed by RelightPass from sabercat::Light.
+struct GpuLight
+{
+    float4 positionType;   // xyz position (Point, Rect); w = type (0 dir, 1 point, 2 rect)
+    float4 direction;      // xyz: direction the light travels (Directional)
+    float4 axisXShadow;    // xyz: axisX * halfWidth (Rect); w = castsShadows (0/1)
+    float4 axisY;          // xyz: axisY * halfHeight (Rect)
+    float4 radiance;       // rgb: color * intensity
+};
+
+// Per-Gaussian surface data resolved by relight_prepare (48 B): either the
+// relightable streams or defaults derived from the canonical ones.
+struct Surfel
+{
+    float4 normalMetallic;     // unit normal xyz (asset space), metallic
+    float4 baseColorRoughness; // linear rgb, roughness
+    float4 ambient;            // x: ambient visibility in [0,1]; yzw unused
+};
+
+// Everything the lighting kernel needs besides the G-buffer (304 B).
+struct LightingParams
+{
+    float4x4 cameraToWorld;     // the inverse of the forward pass's worldToCamera
+    float4 intrinsics;          // fx, fy, cx, cy
+    uint width;
+    uint height;
+    uint lightCount;
+    uint output;                // LightingOutput
+    uint rectSamplesPerAxis;    // sqrt of LightingSettings::rectSamples
+    uint visibilityLight;       // LightingOutput::Visibility layer
+    uint hasEnvironment;
+    uint pad0;
+    float4 backgroundExposure;  // rgb background, w exposure
+    float4 cameraPosition;      // xyz, asset space
+    float4 environment[9];      // radiance SH (rgb), intensity applied
+    float4 depthScale;          // x
+};
+
+// Sabercat's SH basis to degree 3 (16 values) -- exactly the terms and signs
+// of evaluateSHRaw (forward_common.slangh) and of sabercat::shBasis16.
+void shBasis16(float3 d, out float b[16])
+{
+    float x = d.x, y = d.y, z = d.z;
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y, yz = y * z, xz = x * z;
+    b[0] = SABERCAT_SH_C0;
+    b[1] = -SABERCAT_SH_C1 * y;
+    b[2] = SABERCAT_SH_C1 * z;
+    b[3] = -SABERCAT_SH_C1 * x;
+    b[4] = SABERCAT_SH_C2_0 * xy;
+    b[5] = SABERCAT_SH_C2_1 * yz;
+    b[6] = SABERCAT_SH_C2_2 * (2.0f * zz - xx - yy);
+    b[7] = SABERCAT_SH_C2_3 * xz;
+    b[8] = SABERCAT_SH_C2_4 * (xx - yy);
+    b[9] = SABERCAT_SH_C3_0 * y * (3.0f * xx - yy);
+    b[10] = SABERCAT_SH_C3_1 * xy * z;
+    b[11] = SABERCAT_SH_C3_2 * y * (4.0f * zz - xx - yy);
+    b[12] = SABERCAT_SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+    b[13] = SABERCAT_SH_C3_4 * x * (4.0f * zz - xx - yy);
+    b[14] = SABERCAT_SH_C3_5 * z * (xx - yy);
+    b[15] = SABERCAT_SH_C3_6 * x * (xx - 3.0f * yy);
+}
+
+// Cosine-lobe convolution weights per band, divided by pi (Funk-Hecke:
+// pi, 2pi/3, pi/4, 0). Applied to SH of a function f, sum_l w_l sum_m f_lm
+// Y_lm(n) = (1/pi) * integral f(w) max(0, n.w) dw -- exact for band-limited
+// f. Holds for any orthonormal real basis per band, so for the 3DGS-signed
+// one too.
+static const float kCosineBand[4] = { 1.0f, 2.0f / 3.0f, 0.25f, 0.0f };
+
+// ---- BRDF: Lambert + GGX (metallic-roughness, glTF's model) ----
+
+float3 fresnelSchlick(float cosTheta, float3 f0)
+{
+    return f0 + (1.0f - f0) * pow(1.0f - saturate(cosTheta), 5.0f);
+}
+
+float distributionGGX(float NdotH, float alpha)
+{
+    float a2 = alpha * alpha;
+    float d = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    return a2 / max(kPi * d * d, 1e-12f);
+}
+
+// Height-correlated Smith visibility V = G / (4 NdotL NdotV).
+float visibilitySmithGGX(float NdotL, float NdotV, float alpha)
+{
+    float a2 = alpha * alpha;
+    float gv = NdotL * sqrt(NdotV * NdotV * (1.0f - a2) + a2);
+    float gl = NdotV * sqrt(NdotL * NdotL * (1.0f - a2) + a2);
+    return 0.5f / max(gv + gl, 1e-12f);
+}
+
+// BRDF times cos(theta_l): what multiplies incident radiance/irradiance.
+float3 shadeBRDF(float3 N, float3 V, float3 L, float3 baseColor, float roughness, float metallic)
+{
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    float NdotV = max(dot(N, V), 1e-4f);
+    float3 H = normalize(L + V);
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
+    float alpha = max(roughness * roughness, 1e-3f);
+    float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
+    float3 F = fresnelSchlick(VdotH, f0);
+    float3 specular = F * distributionGGX(NdotH, alpha) * visibilitySmithGGX(NdotL, NdotV, alpha);
+    float3 diffuse = (1.0f - F) * (1.0f - metallic) * baseColor / kPi;
+    return (diffuse + specular) * NdotL;
+}
+
+#endif // SABERCAT_RELIGHT_COMMON_SLANGH

@@ -1,0 +1,302 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Gaussian ray-tracing core: visibility of a ray segment
+// THROUGH the splats, for shadow and other secondary rays. Shared by
+// gaussian_aabbs.slang (which bounds every Gaussian for the BLAS) and by any
+// kernel that traces rays against a GaussianAccelerationStructure's TLAS.
+//
+// The 3D model. A Gaussian is density
+//     G(x) = exp(-0.5 * (x - mu)^T Sigma^-1 (x - mu)),  Sigma = R S^2 R^T
+// with R from the stored quaternion and S = diag(scale) -- the covariance
+// forward_project splats, but in 3D. With M = R S, x' = M^-1 (x - mu) is the
+// Gaussian's whitened ("unit sphere") space, where the density is
+// exp(-0.5 |x'|^2).
+//
+// One Gaussian's opacity along a ray. For a ray o + t d its whitened image is
+// o' + t d' (o' = M^-1 (o - mu), d' = M^-1 d) -- still a straight line, so the
+// density along it peaks in closed form at
+//     t* = -dot(o', d') / dot(d', d')
+//     d2min = |o' x d'|^2 / dot(d', d')      (squared whitened distance)
+// and the Gaussian's alpha for the ray is the PEAK alpha
+//     alpha = min(opacity * exp(-0.5 * d2min), SABERCAT_MAX_ALPHA)
+// deposited as if it sat at t*. This is the 3DGRT / 3DGUT "maximum response"
+// evaluation: it is exactly what the rasterizer does along a camera ray (one
+// alpha per Gaussian from its kernel evaluated at one point, composited as a
+// discrete layer), so a ray traced from the camera sees the same kind of
+// alphas the splatter blended. The alternative -- integrating the density
+// along the ray, T = exp(-integral sigma dt) -- is a different (volumetric)
+// model the scene was never trained under, and has no closed form once
+// alpha is clamped. The approximation: a ray grazing a long, thin Gaussian
+// gets its peak alpha once, regardless of how long it travels inside it; and
+// the whole Gaussian is "at" t*, so a segment ending inside a Gaussian counts
+// it fully or not at all depending on which side of t* the end lies.
+//
+// Same conventions as the rasterizer, where they apply in 3D:
+//   - 3-sigma support (SABERCAT_RADIUS_SIGMAS): d2min > 9 contributes nothing.
+//     The BLAS bounds exactly that ellipsoid, so the cut is what makes the
+//     BVH traversal equal a brute-force sum over every Gaussian -- without
+//     it, a ray passing just outside a box would be counted by the brute
+//     force but never reported by the traversal.
+//   - alpha clamped to SABERCAT_MAX_ALPHA (0.99) and skipped below 1/255.
+//   - transmittance below 1e-4 stops the walk. Unlike the rasterizer (which
+//     keeps the last T), the result is then 0: candidates arrive in no
+//     particular order, and "the full product fell below 1e-4" is the only
+//     order-independent statement -- so gaussianTransmittance's result does
+//     not depend on the BVH's traversal order (up to fp rounding).
+//   - NO covariance dilation and NO antialiased opacity compensation, for
+//     either kind of scene. Both are SCREEN-space filters: 0.25 px^2 added to
+//     the projected 2D covariance (and, for antialiased scenes, the alpha
+//     scaled to keep the splat's integral). A secondary ray has no pixel
+//     footprint to filter over, and for a Gaussian large on screen both
+//     effects vanish (compensation -> 1, dilation negligible), so the 3D
+//     model above is what the rasterizer converges to. Raw opacity is also
+//     what 3DGRT uses.
+//
+// Degenerate Gaussians (gaussianRayFrame returns false) never contribute:
+// opacity below 1/255 (its peak alpha could never reach the skip threshold),
+// a scale <= 0, non-finite or above 1e15 (its square would overflow), a
+// zero/non-finite quaternion, a non-finite mean. The quaternion is normalized here (the canonical contract already
+// stores it normalized, so this is a no-op up to rounding there) so that M^-1
+// is exactly S^-1 R^T and the AABB below exactly bounds what the ray sees.
+#ifndef SABERCAT_GAUSSIAN_RAY_SLANGH
+#define SABERCAT_GAUSSIAN_RAY_SLANGH
+
+#include "forward_common.slangh"
+
+#define SABERCAT_RAY_MIN_ALPHA (1.0f / 255.0f)
+#define SABERCAT_RAY_MIN_TRANSMITTANCE 1e-4f
+#define SABERCAT_RAY_MAX_SCALE 1e15f
+
+// Everything needed to put a ray in one Gaussian's whitened space.
+struct GaussianRayFrame
+{
+    float3x3 R;      // rotation (normalized quaternion), columns = local axes
+    float3 invScale; // 1 / scale
+    float3 mean;
+    float opacity;
+};
+
+bool allFinite(float3 v)
+{
+    return all(isfinite(v));
+}
+
+// False for a Gaussian that can never contribute (see the header comment);
+// such Gaussians get a collapsed AABB and are skipped by every ray.
+bool gaussianRayFrame(float3 mean, float3 scale, float4 rotation, float opacity,
+                      out GaussianRayFrame frame)
+{
+    frame = (GaussianRayFrame)0;
+    const float qq = dot(rotation, rotation);
+    if (!(opacity >= SABERCAT_RAY_MIN_ALPHA) || !allFinite(mean) || !allFinite(scale)
+        || !(min(scale.x, min(scale.y, scale.z)) > 0.0f) || !(qq > 0.0f) || !isfinite(qq))
+    {
+        return false;
+    }
+    // A scale so large that its square overflows fp32 (the AABB's row norms
+    // and the whitened distances square it) would give an infinite box and
+    // poison the BVH; such a Gaussian is degenerate too, so every ray agrees
+    // with the BLAS about it. 1e15 is far beyond any scene (and its square,
+    // 1e30, is still finite).
+    const float maxScale = max(scale.x, max(scale.y, scale.z));
+    if (!(maxScale <= SABERCAT_RAY_MAX_SCALE))
+    {
+        return false;
+    }
+    frame.R = quaternionToMatrix(rotation * rsqrt(qq));
+    frame.invScale = 1.0f / scale;
+    frame.mean = mean;
+    frame.opacity = min(opacity, 1.0f);
+    return allFinite(frame.invScale);
+}
+
+// The whitened radius k a ray must come within to possibly contribute: the
+// 3-sigma support, tightened by opacity. A ray's alpha o * exp(-d2/2) clears
+// the 1/255 skip only for d2 <= 2 ln(255 o), so a faint Gaussian's reach is
+// well inside 3 sigma (o = 0.05: k = 2.26; most splats in large captures are
+// that faint). The bound keeps a small relative margin over the alpha test's
+// own rounding, so the box still contains every contributing ray: the BVH
+// stays equal to a brute force over all Gaussians.
+//
+// RayCutoffs (shadow approximations): a caller may raise the alpha skip
+// (minAlpha, passed with its reciprocal so the exact default stays the
+// literal 1/255 and 255) and the transmittance at which a ray stops. The
+// support then shrinks to d2 <= 2 ln(o / minAlpha) -- the BVH must be built
+// with the same cutoffs it is traced with.
+struct RayCutoffs
+{
+    float minAlpha;         // skip a Gaussian whose peak alpha is below this
+    float invMinAlpha;      // 1 / minAlpha
+    float minTransmittance; // a ray darker than this stops and reports 0
+    float pad0;
+};
+
+RayCutoffs exactRayCutoffs()
+{
+    RayCutoffs c;
+    c.minAlpha = SABERCAT_RAY_MIN_ALPHA;
+    c.invMinAlpha = 255.0f;
+    c.minTransmittance = SABERCAT_RAY_MIN_TRANSMITTANCE;
+    c.pad0 = 0.0f;
+    return c;
+}
+
+float gaussianSupportSigmas(float opacity, float invMinAlpha)
+{
+    const float k2 = 2.0f * log(invMinAlpha * opacity) * 1.001f + 1e-3f;
+    return sqrt(clamp(k2, 0.0f, SABERCAT_RADIUS_SIGMAS * SABERCAT_RADIUS_SIGMAS));
+}
+
+float gaussianSupportSigmas(float opacity)
+{
+    return gaussianSupportSigmas(opacity, 255.0f);
+}
+
+// Half extents of the axis-aligned box around the support ellipsoid
+// {mu + M u : |u| <= k}, M = R S, k = gaussianSupportSigmas: along world axis
+// i the extreme is k * |row i of M| = k * sqrt(Sigma_ii). Exact (the box
+// touches the ellipsoid on all six faces), not a sphere-of-the-largest-axis
+// bound.
+float3 gaussianAabbHalfExtent(GaussianRayFrame frame, float invMinAlpha)
+{
+    const float3 scale = 1.0f / frame.invScale;
+    const float3x3 M = float3x3(frame.R[0] * scale, frame.R[1] * scale, frame.R[2] * scale);
+    return gaussianSupportSigmas(frame.opacity, invMinAlpha)
+           * float3(length(M[0]), length(M[1]), length(M[2]));
+}
+
+float3 gaussianAabbHalfExtent(GaussianRayFrame frame)
+{
+    return gaussianAabbHalfExtent(frame, 255.0f);
+}
+
+// The ray o + t d against one Gaussian: its peak alpha and where it peaks
+// (t*, in units of |d|; d need not be normalized). False when the Gaussian
+// does not contribute to this ray: outside its 3-sigma support, alpha below
+// 1/255, or a zero direction. Does NOT test t* against the ray's interval --
+// gaussianTransmittance does.
+bool gaussianRayPeak(GaussianRayFrame frame, float3 origin, float3 dir, float minAlpha,
+                     out float tPeak, out float alpha)
+{
+    tPeak = 0.0f;
+    alpha = 0.0f;
+    // R^T v (mul(v, R) == mul(transpose(R), v)), then S^-1.
+    const float3 o = mul(origin - frame.mean, frame.R) * frame.invScale;
+    const float3 d = mul(dir, frame.R) * frame.invScale;
+    const float dd = dot(d, d);
+    if (!(dd > 0.0f))
+    {
+        return false;
+    }
+    // |o x d|^2 / |d|^2 rather than |o + t* d|^2: no cancellation when the
+    // ray passes near the center of a Gaussian far from the origin.
+    const float3 c = cross(o, d);
+    const float d2 = dot(c, c) / dd;
+    if (d2 > SABERCAT_RADIUS_SIGMAS * SABERCAT_RADIUS_SIGMAS)
+    {
+        return false;
+    }
+    tPeak = -dot(o, d) / dd;
+    alpha = min(frame.opacity * exp(-0.5f * d2), SABERCAT_MAX_ALPHA);
+    return alpha >= minAlpha;
+}
+
+bool gaussianRayPeak(GaussianRayFrame frame, float3 origin, float3 dir, out float tPeak,
+                     out float alpha)
+{
+    return gaussianRayPeak(frame, origin, dir, SABERCAT_RAY_MIN_ALPHA, tPeak, alpha);
+}
+
+// Transmittance of the ray segment origin + t * dir, t in [tMin, tMax], through
+// every Gaussian: the product of (1 - alpha) over the Gaussians whose peak t*
+// lies in [tMin, tMax] (see the header comment for the model). 1 = unoccluded,
+// 0 = blocked (anything below 1e-4 is reported as exactly 0).
+//
+// `tlas` is GaussianAccelerationStructure::tlas(); the four streams are the
+// SAME parameter views it was built/refit from (index = primitive index).
+// Requirements: 0 <= tMin <= tMax, finite origin/dir (Vulkan's ray-query
+// rules). Candidates are never committed and arrive unordered; no sorting is
+// needed because the product is order-independent. A receiver point sitting
+// on a Gaussian sees that Gaussian too: offset tMin (or the origin) as the
+// caller's shading model requires.
+//
+// `skipIndex` excludes one Gaussian -- the one a ray starts inside,
+// e.g. the visibility bake tracing from each Gaussian's own mean, where that
+// Gaussian peaks exactly at t* = 0. 0xFFFFFFFF skips nothing.
+float gaussianTransmittanceSkipping(RaytracingAccelerationStructure tlas,
+                                    StructuredBuffer<float4> means, StructuredBuffer<float4> scales,
+                                    StructuredBuffer<float4> rotations,
+                                    StructuredBuffer<float> opacities, float3 origin, float3 dir,
+                                    float tMin, float tMax, uint skipIndex, RayCutoffs cutoffs)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = tMin;
+    ray.TMax = tMax;
+
+    // Procedural (AABB) geometry only, never committed: every candidate is
+    // evaluated here and the query runs until the BVH is exhausted.
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+
+    float transmittance = 1.0f;
+    while (query.Proceed())
+    {
+        if (query.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
+        {
+            continue;
+        }
+        const uint i = query.CandidatePrimitiveIndex();
+        if (i == skipIndex)
+        {
+            continue;
+        }
+        GaussianRayFrame frame;
+        float tPeak, alpha;
+        if (!gaussianRayFrame(means[i].xyz, scales[i].xyz, rotations[i], opacities[i], frame)
+            || !gaussianRayPeak(frame, origin, dir, cutoffs.minAlpha, tPeak, alpha) || tPeak < tMin
+            || tPeak > tMax)
+        {
+            continue;
+        }
+        transmittance *= 1.0f - alpha;
+        if (transmittance < cutoffs.minTransmittance)
+        {
+            transmittance = 0.0f;
+            query.Abort();
+        }
+    }
+    return transmittance;
+}
+
+float gaussianTransmittanceSkipping(RaytracingAccelerationStructure tlas,
+                                    StructuredBuffer<float4> means, StructuredBuffer<float4> scales,
+                                    StructuredBuffer<float4> rotations,
+                                    StructuredBuffer<float> opacities, float3 origin, float3 dir,
+                                    float tMin, float tMax, uint skipIndex)
+{
+    return gaussianTransmittanceSkipping(tlas, means, scales, rotations, opacities, origin, dir,
+                                         tMin, tMax, skipIndex, exactRayCutoffs());
+}
+
+float gaussianTransmittance(RaytracingAccelerationStructure tlas, StructuredBuffer<float4> means,
+                            StructuredBuffer<float4> scales, StructuredBuffer<float4> rotations,
+                            StructuredBuffer<float> opacities, float3 origin, float3 dir,
+                            float tMin, float tMax, RayCutoffs cutoffs)
+{
+    return gaussianTransmittanceSkipping(tlas, means, scales, rotations, opacities, origin, dir,
+                                         tMin, tMax, 0xFFFFFFFFu, cutoffs);
+}
+
+float gaussianTransmittance(RaytracingAccelerationStructure tlas, StructuredBuffer<float4> means,
+                            StructuredBuffer<float4> scales, StructuredBuffer<float4> rotations,
+                            StructuredBuffer<float> opacities, float3 origin, float3 dir,
+                            float tMin, float tMax)
+{
+    return gaussianTransmittanceSkipping(tlas, means, scales, rotations, opacities, origin, dir,
+                                         tMin, tMax, 0xFFFFFFFFu, exactRayCutoffs());
+}
+
+#endif // SABERCAT_GAUSSIAN_RAY_SLANGH

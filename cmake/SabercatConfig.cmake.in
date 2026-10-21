@@ -1,0 +1,62 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+# find_package(Sabercat) config for an installed Sabercat.
+#
+# Provides:
+#   Sabercat::sabercat    static C++ library (sabercat::Renderer, ...)
+#   Sabercat::sabercat_c  shared library behind the stable C ABI (c_api.h)
+#   SABERCAT_SHADER_DIR   directory of the compiled *.comp.spv; pass it to
+#                         Renderer::initialize / SabercatRendererDesc::shader_dir
+#   sabercat_copy_runtime_dlls(<target>)  copies the DLLs an executable needs
+#
+# Libraries are installed per configuration (lib/<Config>, bin/<Config>), so
+# one prefix can hold Debug and Release side by side and a multi-config
+# consumer links the matching MSVC runtime.
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Vulkan)
+# GLM and VMA headers are installed under include/ (glm/, vma/), so consumers
+# need no separate package for them.
+
+get_filename_component(_SABERCAT_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+
+# libsabercat's private decoders: .spz (spz + its compression libraries) and
+# .sog (libwebp's decode-only archive; zlib is shared with spz). Vendored
+# builds are installed beside Sabercat and declared here (one
+# SabercatDeps-<Config>.cmake per installed configuration fills in the
+# locations); system packages are found instead.
+if(NOT TARGET Sabercat::spz)
+    set(_SABERCAT_SPZ_DEPS)
+    if(@SABERCAT_VENDORED_ZLIB@)
+        add_library(Sabercat::zlib SHARED IMPORTED)
+        list(APPEND _SABERCAT_SPZ_DEPS Sabercat::zlib)
+    else()
+        find_dependency(ZLIB)
+        list(APPEND _SABERCAT_SPZ_DEPS ZLIB::ZLIB)
+    endif()
+    if(@SABERCAT_VENDORED_ZSTD@)
+        add_library(Sabercat::zstd STATIC IMPORTED)
+        list(APPEND _SABERCAT_SPZ_DEPS Sabercat::zstd)
+    else()
+        find_dependency(zstd)
+        list(APPEND _SABERCAT_SPZ_DEPS zstd::libzstd_static)
+    endif()
+    add_library(Sabercat::spz STATIC IMPORTED)
+    set_target_properties(Sabercat::spz PROPERTIES
+        INTERFACE_LINK_LIBRARIES "${_SABERCAT_SPZ_DEPS}")
+    add_library(Sabercat::webpdecoder STATIC IMPORTED)
+    file(GLOB _SABERCAT_DEPS_FILES "${CMAKE_CURRENT_LIST_DIR}/SabercatDeps-*.cmake")
+    foreach(_f IN LISTS _SABERCAT_DEPS_FILES)
+        include("${_f}")
+    endforeach()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SabercatTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/SabercatHelpers.cmake")
+
+set_and_check(SABERCAT_SHADER_DIR "${PACKAGE_PREFIX_DIR}/@SABERCAT_INSTALL_SHADER_DIR@")
+
+check_required_components(Sabercat)
