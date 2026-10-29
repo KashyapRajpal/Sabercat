@@ -2,7 +2,7 @@
 
 # Sabercat
 
-Sabercat is a GPU engine for 3D Gaussian splats. It renders splat scenes in real time, computes gradients through the renderer for training, and relights scenes with ray-traced shadows cast by the splats themselves. No meshes are involved at any stage.
+Sabercat is a GPU engine for 3D Gaussian splats. It renders splat scenes in real time, computes gradients through the renderer for training, and relights scenes with ray-traced shadows cast by the splats themselves.
 
 All GPU work runs as Vulkan 1.3 compute. There is no graphics pipeline and no render pass; the kernels are written in Slang and the host in C++20. Every stage is checked numerically against an independent CPU reference. Sabercat is built to be embedded: a trainer or an application can hand it its own Vulkan device and Gaussian buffers, and Sabercat renders and differentiates them in place, without copies.
 
