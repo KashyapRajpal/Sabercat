@@ -1,0 +1,215 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Launch configuration shared by the host and every Slang kernel
+// (PERFORMANCE.md design rule 9: tile size, workgroup sizes and digit widths
+// are named constants defined ONCE, not literals scattered across kernels).
+//
+// This file is included from Slang shaders AND from C++ (via
+// include/sabercat/render_config.h, which wraps it in a namespace). Keep it
+// to plain `#define`s so both languages can parse it -- no typed constants,
+// no namespaces, no Slang-only syntax.
+#ifndef SABERCAT_CONFIG_SLANGH
+#define SABERCAT_CONFIG_SLANGH
+
+// Screen is binned into TILE_SIZE x TILE_SIZE pixel tiles. One workgroup
+// rasterizes one tile, so this also fixes the raster workgroup size at
+// TILE_SIZE^2 = 256 threads -- a multiple of both 32 (NVIDIA/Intel) and 64
+// (AMD) subgroup widths, so no lanes are wasted on either vendor.
+#define SABERCAT_TILE_SIZE 16
+#define SABERCAT_TILE_THREADS (SABERCAT_TILE_SIZE * SABERCAT_TILE_SIZE)
+
+// Workgroup size for the 1-D per-Gaussian passes (project, tile-bin).
+#define SABERCAT_WORKGROUP_SIZE 256
+
+// Radix sort: 8-bit digits => 256 buckets, 4 passes over a 32-bit key.
+#define SABERCAT_RADIX_BITS 8
+#define SABERCAT_RADIX_BUCKETS (1 << SABERCAT_RADIX_BITS)
+#define SABERCAT_RADIX_PASSES (32 / SABERCAT_RADIX_BITS)
+
+// Device-wide exclusive scan (prefix_sum.slang): each workgroup scans one
+// block of SCAN_ITEMS_PER_THREAD * WORKGROUP_SIZE elements. Shared by the
+// per-Gaussian tile-count scan and the radix sort's digit-offset scan.
+#define SABERCAT_SCAN_ITEMS_PER_THREAD 8
+#define SABERCAT_SCAN_BLOCK (SABERCAT_SCAN_ITEMS_PER_THREAD * SABERCAT_WORKGROUP_SIZE)
+
+// Gaussians are culled when closer than this to the camera plane; matches
+// the reference rasterizer's in_frustum() (p_view.z <= 0.2). Was 1e-4, which
+// let a scene's own Gaussians sitting at the lens (depth ~0.003 on
+// racoonfamily.spz framed from inside its sky shell) project to 1e8 px
+// footprints and paint an opaque wall over 100% of the image.
+#define SABERCAT_MIN_DEPTH 0.2f
+
+// The projection Jacobian is evaluated with x/z and y/z clamped to this
+// multiple of the half-FOV tangent, as in the reference computeCov2D().
+// Without it, Gaussians far outside the frustum near the camera plane get
+// unbounded screen covariances and smear across the whole image. The CENTRE
+// is still projected unclamped; only the covariance uses the clamped point.
+#define SABERCAT_FRUSTUM_CLAMP 1.3f
+
+// Isotropic dilation added to the 2D covariance -- a low-pass filter that
+// keeps sub-pixel Gaussians from vanishing between sample points. Must match
+// the rasterizer a scene is TRAINED against, or alpha differs everywhere.
+//
+// 0.25 matches the reference rasterizer (reference/rasterizer.py and
+// render/torch_reference.py's minimum_variance) -- the oracle Sabercat is
+// verified against and the forward model scenes are trained through. It does
+// NOT match the INRIA 3DGS rasterizer or gsplat (both modes), which use 0.3,
+// so public pretrained scenes render with a slightly narrower low-pass than
+// they were trained with. Deliberately not changed: aligning to 0.3
+// must happen in Sabercat and the training code together, or the two stop agreeing.
+#define SABERCAT_COVARIANCE_DILATION 0.25f
+
+// CameraUniforms::renderFlags bits.
+//
+// ANTIALIASED: scale alpha by sqrt(det(cov2d) / det(cov2d + dilation)) -- the
+// mip-splatting / gsplat "antialiased" opacity compensation. A property of
+// how the SCENE was trained, not a viewer preference: on for scenes authored
+// that way (.spz `antialiased` header flag), off for vanilla 3DGS, which
+// trains without it. The backward pass differentiates through it when set.
+//
+// SAVE_BACKWARD_STATE: tile_rasterize writes per-pixel final transmittance +
+// last-contributor count for the backward pass. Set by ForwardPass itself in
+// differentiable mode only -- callers never set it -- so the viewer path does
+// not pay for the writes.
+#define SABERCAT_RENDER_FLAG_ANTIALIASED 1u
+#define SABERCAT_RENDER_FLAG_SAVE_BACKWARD_STATE 2u
+
+// DEPTH_FLOATS: bits 2-4 hold the depth output's floats per pixel (0, 1, 2 or 4); see
+// tile_rasterize.slang's outputDepthBuffer. ForwardPass sets it for the forward from the
+// renderer's depth layout. BackwardPass CLEARS it and sets it to the layout's n only when it
+// is given a depth gradient, so in backward kernels a non-zero value means "dL/dDepth is
+// supplied, with n floats per pixel". Callers never set them.
+#define SABERCAT_RENDER_FLAG_DEPTH_FLOATS_SHIFT 2u
+#define SABERCAT_RENDER_FLAG_DEPTH_FLOATS_MASK 7u
+
+// Floats per Gaussian in the backward pass's intermediate screen-space
+// gradient buffer (backward_rasterize -> backward_project): dCenter(2),
+// dConic(3), dAlpha(1), dColor(3), dDepth(1) = dL/dz_j, padded to 12 = 48 B,
+// the same 16-byte multiple as ProjectedGaussian.
+#define SABERCAT_PROJECTED_GRADIENT_FLOATS 12
+
+// A Gaussian's screen footprint is taken as this many standard deviations
+// of its largest 2D principal axis.
+#define SABERCAT_RADIUS_SIGMAS 3.0f
+
+// Screen-space size cull (LOD): a Gaussian whose projected footprint
+// radius falls below this many pixels is culled the same way a frustum-miss
+// is. This is a RUNTIME knob -- LODParams::minScreenRadius, DEFAULT 0
+// (disabled) -- and this constant is only the value the viewer's slider
+// starts at. It is not applied unless something sets it.
+//
+// It is off by default because a fixed threshold was measured to
+// destroy real scenes: because the isotropic dilation adds
+// SABERCAT_COVARIANCE_DILATION to both diagonal terms of cov2d, every
+// eigenvalue shifts up by that amount (M = C + D*I has eigenvalues(C) + D),
+// so the smallest radius ANY Gaussian can project to is
+// SABERCAT_RADIUS_SIGMAS * sqrt(SABERCAT_COVARIANCE_DILATION) = 3*sqrt(0.25)
+// = 1.5px. A 2.0px threshold therefore keeps a Gaussian only if its TRUE
+// projected sigma exceeds 0.441px -- and in real scenes most Gaussians are
+// far below that at any normal viewing distance. On the racoonfamily.spz
+// sample it culled ~900,000 of 932,560 Gaussians (>95%), leaving only the
+// handful of huge background-shell Gaussians: the subject vanished entirely
+// and the scene rendered as a featureless ball.
+//
+// The old comment claimed a sub-threshold footprint "contributes negligible
+// coverage to any pixel". True individually, false in aggregate -- those
+// sub-pixel Gaussians collectively ARE the image. Sub-pixel splats are the
+// point of splatting, not noise to discard.
+//
+// Defaulting it off also makes it consistent with every other LOD
+// knob, which are off by default precisely so a future differentiable
+// backward pass never has LOD silently dropping gradient contributors. This
+// cull drops them too; it just never got the same treatment because it was a
+// #define rather than part of LODParams.
+//
+// Any value at or below the 1.5px floor above can never fire.
+#define SABERCAT_DEFAULT_MIN_SCREEN_RADIUS 2.0f
+
+// Alpha is clamped below 1 so accumulated transmittance never reaches
+// exactly zero in a single blend step.
+#define SABERCAT_MAX_ALPHA 0.99f
+
+// Real-valued spherical-harmonics basis constants, matching the reference
+// 3DGS/gsplat rasterizer exactly. Band 0 alone is a flat color
+// (rgb = sh0 * SH_C0 + 0.5); bands 1-3 add the view-dependent terms
+// evaluated by forward_common.slangh's evaluateSH.
+//
+// Coefficient ORDER matters as much as these values: the loader stores them
+// band-ascending per Gaussian (index 0 = DC, 1-3 = band 1, 4-8 = band 2,
+// 9-15 = band 3 -- see ply_reader.cpp), so evaluating through degree d reads
+// the first (d+1)^2 coefficients. That makes a degree cap a correct prefix
+// read, never a reinterpretation of the layout.
+#define SABERCAT_SH_C0 0.28209479177387814f
+
+#define SABERCAT_SH_C1 0.4886025119029199f
+
+#define SABERCAT_SH_C2_0 1.0925484305920792f
+#define SABERCAT_SH_C2_1 (-1.0925484305920792f)
+#define SABERCAT_SH_C2_2 0.31539156525252005f
+#define SABERCAT_SH_C2_3 (-1.0925484305920792f)
+#define SABERCAT_SH_C2_4 0.5462742152960396f
+
+#define SABERCAT_SH_C3_0 (-0.5900435899266435f)
+#define SABERCAT_SH_C3_1 2.890611442640554f
+#define SABERCAT_SH_C3_2 (-0.4570457994644658f)
+#define SABERCAT_SH_C3_3 0.3731763325901154f
+#define SABERCAT_SH_C3_4 (-0.4570457994644658f)
+#define SABERCAT_SH_C3_5 1.445305721320277f
+#define SABERCAT_SH_C3_6 (-0.5900435899266435f)
+
+// Spherical-harmonics coefficients stored per Gaussian: (degree+1)^2 for
+// degree 3. Fixes the stride of the SH stream for both host and shader.
+//
+// Unlike the strides below, this IS a real knob: degree 0 vs 3 is a genuine
+// bandwidth/quality tradeoff.
+#define SABERCAT_SH_DEGREE 3
+#define SABERCAT_SH_COEFFS ((SABERCAT_SH_DEGREE + 1) * (SABERCAT_SH_DEGREE + 1))
+
+// ---------------------------------------------------------------------------
+// Canonical Gaussian stream strides, in bytes.
+//
+// These are NOT tunable. They are facts about the v1 schema, forced by two
+// things that are not ours to choose:
+//
+//   1. std430 gives a vec3 an alignment of 16 bytes, so an array of
+//      tightly-packed 12-byte vec3s does not match what a shader reads from
+//      StructuredBuffer<float4>. Every element after the first would
+//      mis-bind.
+//   2. The shared Sabercat / trainer buffer contract (docs/formats.md) fixes them
+//      so both sides can bind the same memory with zero copies.
+//
+// Setting a stream to 12 would not produce a smaller buffer -- it would
+// produce silent corruption in every shader that reads it. A future fp16
+// variant (PERFORMANCE.md design rule 7) would be a new schema VERSION with
+// its own strides and shader types, not a different value here.
+//
+// There are only two underlying values; the per-stream names below exist to
+// document which stream is which, not to be set independently.
+#define SABERCAT_STRIDE_VEC4 16  // one padded 4-float vector
+#define SABERCAT_STRIDE_SCALAR 4 // one float
+
+#define SABERCAT_STRIDE_MEANS SABERCAT_STRIDE_VEC4     // xyz + pad
+#define SABERCAT_STRIDE_SCALES SABERCAT_STRIDE_VEC4    // linear std-dev xyz + pad
+#define SABERCAT_STRIDE_ROTATIONS SABERCAT_STRIDE_VEC4 // quaternion xyzw, normalized
+#define SABERCAT_STRIDE_SH SABERCAT_STRIDE_VEC4        // RGB + pad, per coefficient
+#define SABERCAT_STRIDE_OPACITY SABERCAT_STRIDE_SCALAR // scalar in [0,1]
+#define SABERCAT_STRIDE_CONFIDENCE SABERCAT_STRIDE_SCALAR // optional scalar
+
+// ---------------------------------------------------------------------------
+// Relightable streams and lighting limits. Optional per-Gaussian
+// streams under the same std430 rules as the canonical ones above; see
+// docs/architecture.md (relighting).
+#define SABERCAT_STRIDE_NORMALS SABERCAT_STRIDE_VEC4         // unit world normal xyz + pad
+#define SABERCAT_STRIDE_BASE_COLOR_ROUGHNESS SABERCAT_STRIDE_VEC4 // linear rgb + roughness
+#define SABERCAT_STRIDE_METALLIC SABERCAT_STRIDE_SCALAR      // scalar in [0,1]
+#define SABERCAT_STRIDE_VISIBILITY SABERCAT_STRIDE_SCALAR    // per coefficient
+// Per-Gaussian visibility is mono SH of degree 3 -- 16 coefficients, R3DG's
+// layout, in the same (3DGS-signed) real SH basis the color SH uses.
+#define SABERCAT_VISIBILITY_COEFFS 16
+// Lights the deferred pass shades per frame (and visibility layers it reads).
+#define SABERCAT_MAX_LIGHTS 8
+// Defaults for scenes without material streams: roughness when absent.
+#define SABERCAT_DEFAULT_ROUGHNESS 0.8f
+
+#endif // SABERCAT_CONFIG_SLANGH

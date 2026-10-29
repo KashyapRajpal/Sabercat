@@ -1,0 +1,412 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Types and math shared by the forward-pass kernels.
+#ifndef SABERCAT_FORWARD_COMMON_SLANGH
+#define SABERCAT_FORWARD_COMMON_SLANGH
+
+#include "config.slangh"
+
+// Mirrors sabercat::CameraUniforms (include/sabercat/camera.h).
+struct CameraUniforms
+{
+    float4x4 worldToCamera;
+
+    float fx;
+    float fy;
+    float cx;
+    float cy;
+
+    uint imageWidth;
+    uint imageHeight;
+    uint tilesX;
+    uint tilesY;
+
+    uint gaussianCount;
+    uint shDegree; // max SH degree to evaluate (0-3)
+    uint renderFlags; // SABERCAT_RENDER_FLAG_*
+    uint pad1;
+
+    // World-space camera position, for the SH view direction.
+    // xyz used, w padding. This lands the struct at exactly 128 bytes -- the
+    // Vulkan-guaranteed minimum maxPushConstantsSize -- so anything added
+    // here after this needs its own binding, not another field.
+    float4 cameraPositionWorld;
+};
+
+// Per-Gaussian output of the projection pass, consumed by tile binning and
+// rasterization. 48 bytes, 16-byte aligned.
+struct ProjectedGaussian
+{
+    float2 center;      // pixel coordinates
+    float depth;        // positive in front of the camera
+    float radius;       // screen-space footprint, in pixels
+
+    float3 conic;       // inverse 2D covariance (a, b, c) for [[a,b],[b,c]]
+    float alpha;        // opacity
+
+    float3 color;       // display-referred sRGB RGB (clamped SH), not linear
+    uint tileCount;     // tiles this Gaussian touches (0 => culled)
+};
+
+// The GPU-driven sizing of everything downstream of forward_project (the
+// replacement for the old host readback of the instance count). One element,
+// written by forward_project (totalInstances, atomically) and
+// instance_dispatch (everything else); read by tile_binning, the radix sort,
+// tile_ranges, and vkCmdDispatchIndirect. Mirrored host-side in
+// forward_pass.cpp. All scalar uints, deliberately no uint3: std430 aligns a
+// uint3 to 16 bytes, which would move the indirect commands off the offsets
+// the host passes to vkCmdDispatchIndirect.
+struct InstanceDispatch
+{
+    // forward_project's InterlockedAdd target. MUST stay first: that kernel
+    // binds this buffer as a plain uint array and adds into element 0.
+    uint totalInstances;
+    // What the sort actually processes: totalInstances when it fits the
+    // instance-sized buffers' capacity, else 0 (render nothing; the host
+    // sees the overflow, grows the buffers and re-runs the instance stages).
+    uint instanceCount;
+    uint sortGroups;    // ceil(instanceCount / WORKGROUP_SIZE) = radix counter row length
+    uint counterCount;  // RADIX_BUCKETS * sortGroups = digit-offset scan length
+
+    // VkDispatchIndirectCommand: one thread per instance (histogram,
+    // scatter, tile_ranges).
+    uint instanceGroupsX;
+    uint instanceGroupsY;
+    uint instanceGroupsZ;
+    // VkDispatchIndirectCommand: one workgroup per SCAN_BLOCK counters
+    // (prefix_sum's block and add phases over the radix counters).
+    uint counterScanGroupsX;
+    uint counterScanGroupsY;
+    uint counterScanGroupsZ;
+
+    uint pad0;
+    uint pad1;
+};
+
+// Rotation matrix from a normalized xyzw quaternion. Matches the reference
+// implementation's quaternion_xyzw_to_matrix.
+float3x3 quaternionToMatrix(float4 q)
+{
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    return float3x3(1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w),
+                    2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w),
+                    2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y));
+}
+
+// Sigma = R diag(scale^2) R^T, derived on the GPU rather than stored --
+// cheaper to recompute from 7 floats than to read back a 3x3.
+float3x3 covarianceFromScaleRotation(float3 scale, float4 rotation)
+{
+    float3x3 R = quaternionToMatrix(rotation);
+    float3x3 S = float3x3(scale.x * scale.x, 0.0f, 0.0f,
+                          0.0f, scale.y * scale.y, 0.0f,
+                          0.0f, 0.0f, scale.z * scale.z);
+    return mul(mul(R, S), transpose(R));
+}
+
+// ---------------------------------------------------------------------------
+// Projection geometry, shared by forward_project and backward_project.
+//
+// The backward pass recomputes everything forward_project derived from the
+// parameters rather than storing it. Both kernels call THIS function, so the
+// recomputation cannot drift from what was actually rendered -- the op order
+// here is exactly forward_project's original inline code, which is why the
+// forward_test pixel-exact fixture is unaffected by the refactor.
+struct ProjectionGeometry
+{
+    bool valid;          // false => culled (near plane or degenerate cov2d)
+
+    float3 localMean;    // camera space
+    float depth;         // -localMean.z
+    float2 center;       // pixels
+
+    float3x3 W;                // world -> camera rotation
+    float3x3 covarianceCamera; // W Sigma W^T
+
+    // Frustum clamp of x/z, y/z inside the Jacobian: -1 clamped low, 0 free,
+    // +1 clamped high. In the clamped region jx = sign*limX*depth, so it no
+    // longer depends on x but DOES depend on depth -- backward needs both.
+    float limX;
+    float limY;
+    float clampSignX;
+    float clampSignY;
+    float jx;
+    float jy;
+    float2x3 J;
+
+    float2x2 cov2dRaw;         // J Sigma_c J^T, before dilation
+    float detBeforeDilation;
+    float2x2 cov2d;            // after dilation
+    float determinant;         // of cov2d (> 0 when valid)
+    float3 conic;              // inverse of cov2d: (a, b, c) for [[a,b],[b,c]]
+    float compensation;        // opacity multiplier; 1 unless ANTIALIASED
+};
+
+ProjectionGeometry computeProjectionGeometry(CameraUniforms camera, float3 worldMean,
+                                             float3 scale, float4 rotation)
+{
+    ProjectionGeometry g = (ProjectionGeometry)0;
+    g.valid = false;
+
+    g.localMean = mul(camera.worldToCamera, float4(worldMean, 1.0f)).xyz;
+
+    // Depth is along the camera's local -Z.
+    g.depth = -g.localMean.z;
+    // Written as "not greater than" so a NaN depth is culled, not rendered.
+    if (!(g.depth > SABERCAT_MIN_DEPTH))
+    {
+        return g;
+    }
+    float depth = g.depth;
+
+    // v is flipped: +Y is up in the world, +v goes down the image.
+    g.center = float2(camera.fx * g.localMean.x / depth + camera.cx,
+                      camera.cy - camera.fy * g.localMean.y / depth);
+
+    // Covariance: world -> camera is a pure rotation for the covariance
+    // (translation doesn't affect a second moment), then camera -> screen
+    // via the projection Jacobian.
+    float3x3 covarianceWorld = covarianceFromScaleRotation(scale, rotation);
+    g.W = (float3x3)camera.worldToCamera;
+    g.covarianceCamera = mul(mul(g.W, covarianceWorld), transpose(g.W));
+
+    // d(u,v)/d(x,y,z) at the Gaussian's center, with x/z and y/z clamped to
+    // the (widened) frustum -- see SABERCAT_FRUSTUM_CLAMP. Row 1 carries the
+    // same sign flip as v above.
+    g.limX = SABERCAT_FRUSTUM_CLAMP * (0.5f * (float)camera.imageWidth) / camera.fx;
+    g.limY = SABERCAT_FRUSTUM_CLAMP * (0.5f * (float)camera.imageHeight) / camera.fy;
+    float tx = g.localMean.x / depth;
+    float ty = g.localMean.y / depth;
+    g.clampSignX = tx < -g.limX ? -1.0f : (tx > g.limX ? 1.0f : 0.0f);
+    g.clampSignY = ty < -g.limY ? -1.0f : (ty > g.limY ? 1.0f : 0.0f);
+    g.jx = clamp(tx, -g.limX, g.limX) * depth;
+    g.jy = clamp(ty, -g.limY, g.limY) * depth;
+    float invDepth = 1.0f / depth;
+    float invDepthSq = invDepth * invDepth;
+    g.J = float2x3(camera.fx * invDepth, 0.0f, camera.fx * g.jx * invDepthSq,
+                   0.0f, -camera.fy * invDepth, -camera.fy * g.jy * invDepthSq);
+
+    g.cov2dRaw = mul(mul(g.J, g.covarianceCamera), transpose(g.J));
+
+    // The TRUE footprint area, before the low-pass dilation widens it --
+    // needed for the opacity compensation.
+    g.detBeforeDilation =
+        g.cov2dRaw[0][0] * g.cov2dRaw[1][1] - g.cov2dRaw[0][1] * g.cov2dRaw[1][0];
+
+    // Low-pass dilation so sub-pixel Gaussians stay visible.
+    g.cov2d = g.cov2dRaw;
+    g.cov2d[0][0] += SABERCAT_COVARIANCE_DILATION;
+    g.cov2d[1][1] += SABERCAT_COVARIANCE_DILATION;
+
+    g.determinant = g.cov2d[0][0] * g.cov2d[1][1] - g.cov2d[0][1] * g.cov2d[1][0];
+    // NaN-safe, as above: a NaN covariance (from a NaN or infinite scale) is culled.
+    if (!(g.determinant > 0.0f))
+    {
+        return g;
+    }
+
+    // Conic = inverse of the symmetric 2x2 covariance.
+    float invDet = 1.0f / g.determinant;
+    g.conic = float3(g.cov2d[1][1] * invDet, -g.cov2d[0][1] * invDet, g.cov2d[0][0] * invDet);
+
+    // Opacity compensation for the dilation, only for scenes trained with it
+    // (see SABERCAT_RENDER_FLAG_ANTIALIASED and forward_project's comment).
+    g.compensation = (camera.renderFlags & SABERCAT_RENDER_FLAG_ANTIALIASED) != 0
+                         ? sqrt(max(g.detBeforeDilation, 0.0f) / g.determinant)
+                         : 1.0f;
+
+    g.valid = true;
+    return g;
+}
+
+// One Gaussian evaluated at one pixel, shared by tile_rasterize and
+// backward_rasterize so the two can never disagree about which (pixel,
+// Gaussian) pairs blended -- the backward pass re-walks exactly the forward
+// sequence, and a single threshold flipping between them would corrupt the
+// recovered transmittance for the rest of the pixel.
+//
+// Returns false where the forward pass skips the pair (negative exponent, or
+// alpha below 1/255). `clamped` reports that alpha hit SABERCAT_MAX_ALPHA: it
+// is then a constant, so nothing upstream of it receives gradient there.
+bool evaluateSplat(float2 pixelPosition, float2 center, float3 conic, float opacity,
+                   out float alpha, out float gaussian, out bool clamped)
+{
+    float2 delta = pixelPosition - center;
+
+    // exponent = delta^T * inverseCovariance * delta
+    float exponent = conic.x * delta.x * delta.x + 2.0f * conic.y * delta.x * delta.y
+                     + conic.z * delta.y * delta.y;
+    alpha = 0.0f;
+    gaussian = 0.0f;
+    clamped = false;
+    if (exponent < 0.0f)
+    {
+        return false;
+    }
+
+    gaussian = exp(-0.5f * exponent);
+    float rawAlpha = opacity * gaussian;
+    alpha = min(rawAlpha, SABERCAT_MAX_ALPHA);
+    clamped = rawAlpha > SABERCAT_MAX_ALPHA;
+    return alpha >= 1.0f / 255.0f;
+}
+
+// View-dependent color from the SH coefficients, evaluated through `degree`
+// (0-3). Bands are added cumulatively, so a lower degree both costs less
+// arithmetic AND reads fewer coefficients -- the basis of the
+// appearance LOD. `dir` must be a normalized world-space direction from the
+// camera toward the Gaussian.
+//
+// The +0.5 offset and [0,1] clamp match the reference rasterizer: SH stores
+// color centered on zero, and the DC term alone is a mid-gray offset.
+//
+// Split in two for the backward pass: evaluateSHRaw is the bare basis sum, which
+// backward_project also needs (to know which channels the clamp cut off).
+//
+// Each band >= 1 is its own function so the band fade
+// (evaluateSHFaded) can scale one band without a second copy of the basis.
+// evaluateSHRaw adds them in exactly the order the inline sum did, so the
+// unfaded path is unchanged op for op.
+float3 evaluateSHBand1(StructuredBuffer<float4> coefficients, uint base, float3 dir)
+{
+    float x = dir.x, y = dir.y, z = dir.z;
+    return SABERCAT_SH_C1
+           * (-y * coefficients[base + 1].xyz + z * coefficients[base + 2].xyz
+              - x * coefficients[base + 3].xyz);
+}
+
+float3 evaluateSHBand2(StructuredBuffer<float4> coefficients, uint base, float3 dir)
+{
+    float x = dir.x, y = dir.y, z = dir.z;
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y, yz = y * z, xz = x * z;
+    return SABERCAT_SH_C2_0 * xy * coefficients[base + 4].xyz
+           + SABERCAT_SH_C2_1 * yz * coefficients[base + 5].xyz
+           + SABERCAT_SH_C2_2 * (2.0f * zz - xx - yy) * coefficients[base + 6].xyz
+           + SABERCAT_SH_C2_3 * xz * coefficients[base + 7].xyz
+           + SABERCAT_SH_C2_4 * (xx - yy) * coefficients[base + 8].xyz;
+}
+
+float3 evaluateSHBand3(StructuredBuffer<float4> coefficients, uint base, float3 dir)
+{
+    float x = dir.x, y = dir.y, z = dir.z;
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y;
+    return SABERCAT_SH_C3_0 * y * (3.0f * xx - yy) * coefficients[base + 9].xyz
+           + SABERCAT_SH_C3_1 * xy * z * coefficients[base + 10].xyz
+           + SABERCAT_SH_C3_2 * y * (4.0f * zz - xx - yy) * coefficients[base + 11].xyz
+           + SABERCAT_SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy)
+                 * coefficients[base + 12].xyz
+           + SABERCAT_SH_C3_4 * x * (4.0f * zz - xx - yy) * coefficients[base + 13].xyz
+           + SABERCAT_SH_C3_5 * z * (xx - yy) * coefficients[base + 14].xyz
+           + SABERCAT_SH_C3_6 * x * (xx - 3.0f * yy) * coefficients[base + 15].xyz;
+}
+
+float3 evaluateSHRaw(uint degree, StructuredBuffer<float4> coefficients, uint base, float3 dir)
+{
+    float3 result = SABERCAT_SH_C0 * coefficients[base].xyz;
+
+    if (degree >= 1)
+    {
+        result += evaluateSHBand1(coefficients, base, dir);
+
+        if (degree >= 2)
+        {
+            result += evaluateSHBand2(coefficients, base, dir);
+
+            if (degree >= 3)
+            {
+                result += evaluateSHBand3(coefficients, base, dir);
+            }
+        }
+    }
+
+    return result;
+}
+
+float3 evaluateSH(uint degree, StructuredBuffer<float4> coefficients, uint base, float3 dir)
+{
+    return clamp(evaluateSHRaw(degree, coefficients, base, dir) + 0.5f, 0.0f, 1.0f);
+}
+
+// Band fade: evaluateSH through `degree` (1-3) with the top band
+// scaled by `topBandWeight` in [0, 1] -- 1 is exactly evaluateSH(degree),
+// 0 is exactly evaluateSH(degree - 1) -- so the adaptive degree can cross a
+// threshold continuously instead of popping. Reads the same coefficients
+// evaluateSH(degree) would; viewer-only (forward_project calls it only when
+// the weight is below 1, which a Differentiable run's all-zero LODParams
+// never produces).
+float3 evaluateSHFaded(uint degree, float topBandWeight, StructuredBuffer<float4> coefficients,
+                       uint base, float3 dir)
+{
+    float3 topBand = degree >= 3 ? evaluateSHBand3(coefficients, base, dir)
+                     : degree == 2 ? evaluateSHBand2(coefficients, base, dir)
+                                   : evaluateSHBand1(coefficients, base, dir);
+    float3 raw = evaluateSHRaw(degree - 1, coefficients, base, dir) + topBandWeight * topBand;
+    return clamp(raw + 0.5f, 0.0f, 1.0f);
+}
+
+// Dynamic LOD: viewer-only tuning knobs for the distance + tile-
+// density hybrid reduction in forward_project. Deliberately NOT part of
+// CameraUniforms (the canonical struct shared with the trainer, per
+// docs/formats.md) -- LOD must never silently drop a Gaussian during a
+// differentiable backward pass, so it lives behind its own `enabled` flag
+// in its own binding, off by default.
+struct LODParams
+{
+    uint enabled;
+    float nearDistance;      // depth below which distance-based dropping starts
+    float farDistance;       // depth at which distance-based dropping saturates
+    float maxDropDistance;   // max fraction dropped purely from distance
+    float maxDropDensity;    // max fraction dropped purely from tile density
+    float densityReference;  // previous-frame instance count considered "full" density
+
+    // Appearance LOD: the same distance/density pressure, mapped
+    // onto SH degree instead of a binary keep/drop. Independently gated so
+    // appearance can degrade without any geometry being dropped (and vice
+    // versa).
+    uint appearanceEnabled;
+    float appearanceMaxDropDistance; // degree steps lost at full distance pressure
+    float appearanceMaxDropDensity;  // degree steps lost at full density pressure
+    // Band fade: the fraction (0-1] of each degree step, ending exactly at
+    // the hard threshold, over which the outgoing top band fades to zero
+    // instead of switching off at once. 0 = hard switches (the default, and
+    // the pre-fade behavior bit for bit); 1 = a fully continuous fractional
+    // degree. Only ever lowers quality relative to the hard switch, never
+    // reads extra coefficients.
+    float appearanceFadeWidth;
+
+    // Screen-space size cull threshold in pixels. 0 disables it, which is the
+    // default -- see config.slangh for why an unconditional 2.0f here erased
+    // >95% of a real scene. Gated on its own, independent of `enabled`,
+    // because it is a plain visibility threshold rather than part of the
+    // distance/density pressure model.
+    float minScreenRadius;
+};
+
+// A Wang hash of the Gaussian's own index -- deterministic and NOT seeded by
+// frame/time, so which Gaussians a given drop fraction keeps changes
+// smoothly (nested-threshold: raising the fraction only removes Gaussians
+// already near the margin) rather than reshuffling the whole surviving set
+// every frame.
+uint wangHash(uint seed)
+{
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    return seed;
+}
+
+// Top 24 bits of the hash mapped to [0, 1) -- the low bits of most integer
+// hashes (this one included) are the weakest, so they're discarded here.
+float hashToUnitFloat(uint index)
+{
+    // >> 8u leaves a 24-bit value in [0, 2^24); 1/16777216 == 1/2^24 rescales
+    // that to [0, 1).
+    return (float)(wangHash(index) >> 8u) * (1.0f / 16777216.0f);
+}
+
+#endif // SABERCAT_FORWARD_COMMON_SLANGH

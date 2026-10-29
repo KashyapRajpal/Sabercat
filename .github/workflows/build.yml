@@ -1,0 +1,58 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+name: build
+
+# Builds Sabercat on Windows, runs the CPU unit tests and checks that the install
+# step works. The GPU tests are not run here: hosted GitHub runners have no GPU,
+# and the examples/*_test programs (registered with CTest in tests/integration)
+# need a Vulkan 1.3 device. Run them locally with:
+#   ctest --test-dir build -C Release -L gpu --output-on-failure
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Pinned: the build uses the "Visual Studio 17 2022" generator, and
+    # windows-latest has moved to an image without Visual Studio 2022.
+    runs-on: windows-2022
+    steps:
+      # Recursive, because external/ holds submodules (spz, and others).
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+
+      # Installs the full Vulkan SDK (stripdown is off by default), which ships
+      # slangc.exe and the Vulkan 1.3 headers that the shader build needs. The
+      # version matches the local development SDK (1.4.309.0).
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
+        with:
+          vulkan_version: 1.4.309.0
+
+      # Multi-config generator: Debug and Release come from the --config flag
+      # at build time, so the configure step is shared.
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Debug
+        run: cmake --build build --config Debug --parallel
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      # The CPU-only unit tests (label cpu) need no GPU, so they run on the
+      # hosted runner. The GPU tests (label gpu) stay local.
+      - name: Unit tests
+        run: ctest --test-dir build -C Release -L cpu --output-on-failure
+
+      # Installs the Release build into a staging directory to check the
+      # install rules. Nothing is uploaded.
+      - name: Install (staging)
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}/staging"

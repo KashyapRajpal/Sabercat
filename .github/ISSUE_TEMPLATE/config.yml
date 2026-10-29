@@ -1,0 +1,8 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/KashyapRajpal/Sabercat/blob/main/SECURITY.md
+    about: Please do not open a public issue for a vulnerability. Follow the steps in SECURITY.md.

@@ -1,0 +1,135 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Visibility of one light from one receiver point, traced
+// through the splats. Shared by shadow_rt.slang (per pixel, the ray-traced
+// shadow reference) and teacher.slang (per training sample), so a teacher
+// target IS the reference shadow value at that receiver -- same rays, same
+// arithmetic, bit for bit.
+//
+// V = mean over an N x N fixed stratified grid on the emitter of the
+// transmittance of the ray from the receiver to the sample
+// (gaussianTransmittance). No randomness: deterministic, and it converges
+// smoothly as the grid refines.
+//
+//   Point       a disk of radius lightSize facing the receiver
+//   Directional the cone of half-angle atan(lightSize) around -direction
+//   Rect        the rectangle spanned by axisX/axisY (half extents folded in)
+//
+// Kernels including this compile with the ray-query flags
+// (shaders/CMakeLists.txt).
+#ifndef SABERCAT_LIGHT_VISIBILITY_SLANGH
+#define SABERCAT_LIGHT_VISIBILITY_SLANGH
+
+#include "gaussian_ray.slangh"
+
+// One light as the tracer needs it (std430, 80 B; host mirrors in
+// shadow_pass.cpp's RayShadowParams fields and visibility_pass.cpp's
+// TraceLight).
+struct TraceLight
+{
+    float4 positionType; // xyz position; w = type (0 dir, 1 point, 2 rect)
+    float4 direction;    // xyz: direction the light travels (Directional)
+    float4 axisX;        // xyz: axisX * halfWidth (Rect)
+    float4 axisY;        // xyz: axisY * halfHeight (Rect)
+    float4 sizeLength;   // x: lightSize (Point: disk radius; Directional: tan(angular radius));
+                         // y: rayLength (how far a directional ray reaches)
+};
+
+void tangentFrame(float3 n, out float3 t, out float3 b)
+{
+    float3 helper = abs(n.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+    t = normalize(cross(helper, n));
+    b = cross(n, t);
+}
+
+// The asset-space receiver of G-buffer pixel (x, y): position reconstructed
+// from the expected depth, and the unit normal (zero if the blend canceled).
+// False where the pixel has no coverage.
+bool gbufferReceiver(float4 normalDepth, float coverage, uint x, uint y, float4x4 cameraToWorld,
+                     float4 intrinsics, out float3 position, out float3 normal)
+{
+    position = float3(0.0f, 0.0f, 0.0f);
+    normal = float3(0.0f, 0.0f, 0.0f);
+    if (!(coverage > 1e-6f))
+    {
+        return false;
+    }
+    float depth = normalDepth.w / coverage;
+    float nLen = length(normalDepth.xyz);
+    normal = nLen > 1e-8f ? normalDepth.xyz / nLen : float3(0.0f, 0.0f, 0.0f);
+    float3 local = float3((float(x) - intrinsics.z) * depth / intrinsics.x,
+                          (intrinsics.w - float(y)) * depth / intrinsics.y, -depth);
+    position = mul(cameraToWorld, float4(local, 1.0f)).xyz;
+    return true;
+}
+
+// Transmittance of emitter sample s (row-major in the n x n grid: sx = s % n,
+// sy = s / n) of `light` from ray origin P (the caller has already offset the
+// receiver along its normal).
+float emitterSampleTransmittance(RaytracingAccelerationStructure tlas, StructuredBuffer<float4> means,
+                                 StructuredBuffer<float4> scales, StructuredBuffer<float4> rotations,
+                                 StructuredBuffer<float> opacities, TraceLight light, float3 P,
+                                 uint s, uint n, RayCutoffs cutoffs)
+{
+    uint type = uint(light.positionType.w + 0.5f);
+    float lightSize = light.sizeLength.x;
+    uint sx = s % n;
+    uint sy = s / n;
+    float u = (float(sx) + 0.5f) / float(n) * 2.0f - 1.0f;
+    float v = (float(sy) + 0.5f) / float(n) * 2.0f - 1.0f;
+    float3 dir;
+    float tMax;
+    if (type == 0u)
+    {
+        float3 toLight = -normalize(light.direction.xyz);
+        float3 t, b;
+        tangentFrame(toLight, t, b);
+        dir = normalize(toLight + (u * t + v * b) * lightSize * 0.8862f);
+        tMax = light.sizeLength.y;
+    }
+    else
+    {
+        float3 S;
+        if (type == 1u)
+        {
+            float3 toCenter = normalize(light.positionType.xyz - P);
+            float3 t, b;
+            tangentFrame(toCenter, t, b);
+            // Equal-area square -> disk: half side r*sqrt(pi)/2.
+            S = light.positionType.xyz + (u * t + v * b) * lightSize * 0.8862f;
+        }
+        else
+        {
+            S = light.positionType.xyz + u * light.axisX.xyz + v * light.axisY.xyz;
+        }
+        float3 toS = S - P;
+        float dist = length(toS);
+        dir = toS / max(dist, 1e-8f);
+        tMax = dist;
+    }
+    // tMin 0: surface Gaussians behind the offset origin peak at t* <= 0 for
+    // outgoing rays and are skipped by the [tMin, tMax] test, so a receiver
+    // does not shadow itself.
+    return gaussianTransmittance(tlas, means, scales, rotations, opacities, P, dir, 0.0f, tMax, cutoffs);
+}
+
+// V in [0, 1] of `light` from ray origin P: the mean over the whole grid,
+// summed in sample order s = 0, 1, ... -- the order shadow_rt's progressive
+// accumulation follows, so a converged progressive result is this value bit
+// for bit.
+float lightVisibility(RaytracingAccelerationStructure tlas, StructuredBuffer<float4> means,
+                      StructuredBuffer<float4> scales, StructuredBuffer<float4> rotations,
+                      StructuredBuffer<float> opacities, TraceLight light, float3 P,
+                      uint samplesPerAxis, RayCutoffs cutoffs)
+{
+    uint n = max(samplesPerAxis, 1u);
+    float sum = 0.0f;
+    for (uint s = 0; s < n * n; ++s)
+    {
+        sum += emitterSampleTransmittance(tlas, means, scales, rotations, opacities, light, P, s, n, cutoffs);
+    }
+    return sum / float(n * n);
+}
+
+#endif // SABERCAT_LIGHT_VISIBILITY_SLANGH
