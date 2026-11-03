@@ -1411,7 +1411,22 @@ void partI()
     glfwGetFramebufferSize(window, &fbw, &fbh);
     require(r.width() == uint32_t(fbw) && r.height() == uint32_t(fbh),
             "(I) width()/height() after attachSurface differ from the framebuffer");
-    frame();
+    // Exercise repeated image acquisition / semaphore reuse, not just the
+    // first pair of frame slots. Modern validation layers check that a present
+    // wait semaphore is not signaled again while presentation still owns it.
+    // 120 is a bounded stress-test budget, not a Vulkan requirement: it gives
+    // repeated opportunities for reuse before and after swapchain recreation
+    // without making the test lengthy. No finite count guarantees a race fires.
+    static constexpr int kPresentationStressFrames = 120;
+    const auto presentBurst = [&]()
+    {
+        for (int i = 0; i < kPresentationStressFrames; ++i)
+        {
+            glfwPollEvents();
+            frame();
+        }
+    };
+    presentBurst();
 
     // Resize: width()/height() must follow the window once the swapchain is recreated.
     const int targetW = 300, targetH = 170;
@@ -1435,6 +1450,7 @@ void partI()
     require(resized.size() == size_t(targetW) * targetH * 4,
             "(I) forward output does not match the resized swapchain");
     r.present();
+    presentBurst(); // new swapchain images must have their own presentation semaphores
     std::printf("    resized 320x200 -> %dx%d: width()/height() followed after %d present() call(s); "
                 "forward output %dx%d\n",
                 targetW, targetH, presents, targetW, targetH);

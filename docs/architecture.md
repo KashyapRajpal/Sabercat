@@ -151,12 +151,15 @@ the instance.
 - **`DescriptorSet`** owns a pool and its layouts. `bindBuffer` and
   `bindImage` update the set immediately.
 - **`Pipeline`** creates pipeline layouts and compute pipelines.
-- **`CommandBuffer`** is a record-only wrapper. The `examples/*_test` programs use it. The
-  renderer records through raw `vkCmd*` calls.
+- **`CommandBuffer`** owns a scoped command-buffer allocation. Its submitted work
+  must complete before destruction frees it; the frame passes wait before leaving
+  scope. Recording uses the wrapper's helpers and raw `vkCmd*` calls.
 
 Passes that run per frame record into their own command pools. `ForwardPass`
 submits on its own pool. `Renderer` keeps `FrameContext frames[2]`, one pool
-per frame in flight, each with its own semaphores and fence.
+per frame in flight, each with its own acquire semaphore and fence. Presentation
+wait semaphores belong to swapchain images and are reused after reacquiring the
+same image; a frame fence alone does not prove presentation has finished.
 
 ---
 

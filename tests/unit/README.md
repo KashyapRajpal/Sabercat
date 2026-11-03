@@ -3,6 +3,10 @@
 CPU-only unit tests (CTest label `cpu`). They need no Vulkan device and no
 window, so they run on the hosted CI runner.
 
+- `sabercat_command_buffer_test` uses a bounded fake Vulkan allocator to check
+  command-buffer cleanup across 10,000 submission scopes and exception unwinding.
+  It is also built when the application targets are disabled.
+
 - `sabercat_unit_test` covers the apps' GPU-free logic: the orbit camera
   (`apps/common/orbit_camera.h`), the Studio project model and app-state JSON
   (`apps/studio/studio_state.h`), and the app policy and scene scan

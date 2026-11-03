@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-03
+
+### Fixed
+
+- Associate presentation wait semaphores with acquired swapchain images instead
+  of frame slots, preventing reuse while the presentation engine may still own
+  them. Recreate these semaphores with the swapchain.
+- Limit Viewer to 240 FPS by default to avoid unbounded mailbox rendering.
+  `--max-fps 0` restores unlimited rendering; `--diagnostic-seconds` provides
+  bounded frame-timing runs for investigating responsiveness problems.
+- Free scoped Vulkan command buffers after completed submissions. Previously,
+  rendering retained another command-buffer allocation each frame until the
+  pool was destroyed, causing memory growth and increasing pool-reset work
+  even with relighting disabled.
+
 ## [1.0.0] - 2026-10-28
 
 First public release.
@@ -52,5 +67,6 @@ First public release.
 
 Numerical behavior is covered by `forward_regression_test`, which stores hashes of the forward output. Any change that alters a stored hash gets an entry under Numerics in the release that makes it.
 
-[Unreleased]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/KashyapRajpal/Sabercat/releases/tag/v1.0.0

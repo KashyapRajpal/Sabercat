@@ -2,6 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Unit tests (CPU-only, label `cpu`). See README.md in this directory.
+
+# Intercepts command-buffer allocation/free to check bounded ownership without
+# a Vulkan device. Keep this independent of the optional application targets.
+add_executable(sabercat_command_buffer_test test_command_buffer.cpp)
+target_link_libraries(sabercat_command_buffer_test PRIVATE sabercat)
+if(TARGET zlib)
+    add_custom_command(TARGET sabercat_command_buffer_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:zlib> $<TARGET_FILE_DIR:sabercat_command_buffer_test>)
+endif()
+add_test(NAME command_buffer_test COMMAND $<TARGET_FILE:sabercat_command_buffer_test>)
+set_tests_properties(command_buffer_test PROPERTIES LABELS cpu TIMEOUT 60)
 #
 # One executable covers the GPU-free parts of the apps: the orbit camera, the
 # Studio's document model and the app policy. It links their libraries, so it

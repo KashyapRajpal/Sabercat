@@ -99,13 +99,15 @@ enum class DebugView
 };
 
 // Frames-in-flight count (PERFORMANCE.md design rule 3): command buffers,
-// per-frame descriptor sets, and sync objects are all duplicated this many
+// per-frame descriptor sets, acquire semaphores and fences are duplicated this many
 // times so the CPU can record frame N+1 while the GPU still works on frame
 // N. Shared here rather than kept as a renderer.cpp-local constant because
 // DebugVisualizer's own per-frame descriptor set/display image must use the
 // exact same count to stay in lockstep with Renderer's frame index -- a
 // mismatch would silently reopen the same "descriptor set in use by a
 // pending command buffer" race N-buffering this constant exists to close.
+// Present-wait semaphores are instead owned by individual swapchain images:
+// completing a frame's submission does not prove its presentation is finished.
 constexpr uint32_t kMaxFramesInFlight = 2;
 
 // Differentiable 3D Gaussian Splatting renderer -- the reusable rendering core.

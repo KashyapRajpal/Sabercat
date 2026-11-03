@@ -231,6 +231,10 @@ class Renderer::Impl
     // attachment (Dear ImGui's UI pass); the blit/clear path before it only
     // ever needed raw VkImage handles.
     std::vector<VkImageView> swapchainImageViews;
+    // Presentation can still be waiting on a semaphore after the submitting
+    // frame's fence signals. Reuse it only after acquiring the same image,
+    // not when a CPU frame slot becomes available again.
+    std::vector<VkSemaphore> presentReady;
     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent{};
 
@@ -246,7 +250,6 @@ class Renderer::Impl
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
-        VkSemaphore renderFinished = VK_NULL_HANDLE;
         VkFence inFlight = VK_NULL_HANDLE;
     };
     FrameContext frames[kMaxFramesInFlight];
@@ -362,6 +365,15 @@ void Renderer::Impl::createSwapchain(uint32_t width, uint32_t height)
     swapchainImages.resize(actualImageCount);
     vkGetSwapchainImagesKHR(device.handle(), swapchain, &actualImageCount, swapchainImages.data());
 
+    presentReady.resize(swapchainImages.size(), VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo presentSemaphoreInfo{};
+    presentSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (VkSemaphore & semaphore : presentReady)
+    {
+        VK_CHECK(vkCreateSemaphore(device.handle(), &presentSemaphoreInfo, nullptr, &semaphore),
+                 "Failed to create per-image presentation semaphore");
+    }
+
     swapchainFormat = surfaceFormat.format;
     swapchainExtent = extent;
     Logger::info("Swapchain " + std::to_string(extent.width) + "x" + std::to_string(extent.height)
@@ -398,6 +410,14 @@ void Renderer::Impl::createSwapchain(uint32_t width, uint32_t height)
 
 void Renderer::Impl::destroySwapchain()
 {
+    for (VkSemaphore semaphore : presentReady)
+    {
+        if (semaphore != VK_NULL_HANDLE)
+        {
+            vkDestroySemaphore(device.handle(), semaphore, nullptr);
+        }
+    }
+    presentReady.clear();
     for (VkImageView view : swapchainImageViews)
     {
         vkDestroyImageView(device.handle(), view, nullptr);
@@ -441,8 +461,6 @@ void Renderer::Impl::createFrameContexts()
 
         VK_CHECK(vkCreateSemaphore(device.handle(), &semInfo, nullptr, &frame.imageAvailable),
                  "Failed to create imageAvailable semaphore");
-        VK_CHECK(vkCreateSemaphore(device.handle(), &semInfo, nullptr, &frame.renderFinished),
-                 "Failed to create renderFinished semaphore");
         VK_CHECK(vkCreateFence(device.handle(), &fenceInfo, nullptr, &frame.inFlight),
                  "Failed to create inFlight fence");
     }
@@ -455,10 +473,6 @@ void Renderer::Impl::destroyFrameContexts()
         if (frame.inFlight != VK_NULL_HANDLE)
         {
             vkDestroyFence(device.handle(), frame.inFlight, nullptr);
-        }
-        if (frame.renderFinished != VK_NULL_HANDLE)
-        {
-            vkDestroySemaphore(device.handle(), frame.renderFinished, nullptr);
         }
         if (frame.imageAvailable != VK_NULL_HANDLE)
         {
@@ -1747,7 +1761,10 @@ void Renderer::present()
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &frame.cmd;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &frame.renderFinished;
+    // The imageAvailable wait orders this signal after the previous present
+    // of imageIndex. The frame fence alone cannot establish that ordering.
+    const VkSemaphore presentReady = m_impl->presentReady[imageIndex];
+    submitInfo.pSignalSemaphores = &presentReady;
 
     VK_CHECK(vkQueueSubmit(m_impl->device.graphicsQueue(), 1, &submitInfo, frame.inFlight),
              "Failed to submit frame command buffer");
@@ -1755,7 +1772,7 @@ void Renderer::present()
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &frame.renderFinished;
+    presentInfo.pWaitSemaphores = &presentReady;
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &m_impl->swapchain;
     presentInfo.pImageIndices = &imageIndex;

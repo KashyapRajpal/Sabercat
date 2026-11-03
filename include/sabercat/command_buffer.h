@@ -11,8 +11,13 @@ namespace sabercat
 class CommandBuffer
 {
   public:
+    // Owns one allocation from pool. The device and pool must outlive this
+    // object, and any submitted work must finish before it is destroyed.
     CommandBuffer(VkDevice device, VkCommandPool pool);
     ~CommandBuffer();
+
+    CommandBuffer(const CommandBuffer &) = delete;
+    CommandBuffer & operator=(const CommandBuffer &) = delete;
 
     // Get Vulkan handle
     VkCommandBuffer getHandle() const

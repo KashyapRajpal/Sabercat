@@ -13,13 +13,17 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "about_logo.h"
@@ -104,6 +108,10 @@ int main(int argc, char * argv[])
     bool startRelit = false; // `--relight`: start with relighting on
     bool validationFlag = false;   // `--validation`: validation in Release too
     bool noValidationFlag = false; // `--no-validation`: off even in Debug
+    // Mailbox presentation can run hundreds of frames ahead of the display's
+    // refresh rate. Leave time for the desktop and other GPU applications.
+    double maxFps = 240.0;
+    double diagnosticSeconds = 0.0;
     for (int i = 1; i < argc; ++i)
     {
         if (std::string(argv[i]) == "--borrowed")
@@ -121,6 +129,42 @@ int main(int argc, char * argv[])
         else if (std::string(argv[i]) == "--no-validation")
         {
             noValidationFlag = true;
+        }
+        else if (std::string(argv[i]) == "--max-fps"
+                 || std::string(argv[i]) == "--diagnostic-seconds")
+        {
+            const std::string option = argv[i];
+            try
+            {
+                if (++i >= argc)
+                {
+                    throw std::runtime_error("missing value");
+                }
+                size_t consumed = 0;
+                const double value = std::stod(argv[i], &consumed);
+                if (consumed != std::string(argv[i]).size() || !std::isfinite(value)
+                    || value < 0.0 || value > 10000.0)
+                {
+                    throw std::runtime_error("expected a number from 0 to 10000");
+                }
+                if (option == "--max-fps")
+                {
+                    if (value > 0.0 && value < 1.0)
+                    {
+                        throw std::runtime_error("expected 0 (unlimited) or at least 1 FPS");
+                    }
+                    maxFps = value;
+                }
+                else
+                {
+                    diagnosticSeconds = value;
+                }
+            }
+            catch (const std::exception & e)
+            {
+                Logger::error(option + ": " + e.what());
+                return 1;
+            }
         }
         else if (std::string(argv[i]) == "--log" && i + 1 < argc)
         {
@@ -338,11 +382,22 @@ int main(int argc, char * argv[])
         // half of the step.
         lodParams.appearanceFadeWidth = 0.5f;
 
+        Logger::info("Viewer frame limit: "
+                     + (maxFps > 0.0 ? std::to_string(maxFps) + " FPS" : "unlimited"));
+        const double diagnosticStart = glfwGetTime();
+        double sampleStart = diagnosticStart;
+        uint32_t sampleFrames = 0;
+        double forwardSeconds = 0.0, presentSeconds = 0.0, maxWorkSeconds = 0.0;
         while (!glfwWindowShouldClose(window))
         {
+            const auto frameStart = std::chrono::steady_clock::now();
             glfwPollEvents();
 
             double now = glfwGetTime();
+            if (diagnosticSeconds > 0.0 && now - diagnosticStart >= diagnosticSeconds)
+            {
+                break;
+            }
             float deltaTime = static_cast<float>(now - lastFrameTime);
             lastFrameTime = now;
 
@@ -398,6 +453,14 @@ int main(int argc, char * argv[])
             ImGui::Text("%.1f FPS (%.2f ms/frame)", ImGui::GetIO().Framerate,
                        1000.0f / ImGui::GetIO().Framerate);
             ImGui::Text("Gaussians: %u", renderer.gaussianCount());
+            if (maxFps > 0.0)
+            {
+                ImGui::Text("Frame limit: %.0f FPS", maxFps);
+            }
+            else
+            {
+                ImGui::TextUnformatted("Frame limit: unlimited");
+            }
             ImGui::Separator();
 
             // Row 1: the scene list and the one Load button. Load is off while a
@@ -687,8 +750,40 @@ int main(int argc, char * argv[])
 
             ImGui::Render();
 
+            const double forwardStart = glfwGetTime();
             renderer.forward();
+            const double presentStart = glfwGetTime();
             renderer.present();
+            const double workEnd = glfwGetTime();
+            if (diagnosticSeconds > 0.0)
+            {
+                ++sampleFrames;
+                forwardSeconds += presentStart - forwardStart;
+                presentSeconds += workEnd - presentStart;
+                maxWorkSeconds = std::max(maxWorkSeconds, workEnd - now);
+                if (workEnd - sampleStart >= 1.0)
+                {
+                    char sample[320];
+                    std::snprintf(sample, sizeof(sample),
+                                  "Frame timing: %.1f FPS, forward %.3f ms, present %.3f ms, "
+                                  "max work %.3f ms, %u tile instances, relight %s",
+                                  sampleFrames / (workEnd - sampleStart),
+                                  1000.0 * forwardSeconds / sampleFrames,
+                                  1000.0 * presentSeconds / sampleFrames,
+                                  1000.0 * maxWorkSeconds, renderer.lastInstanceCount(),
+                                  renderer.lightingEnabled() ? "on" : "off");
+                    Logger::info(sample);
+                    sampleStart = workEnd;
+                    sampleFrames = 0;
+                    forwardSeconds = presentSeconds = maxWorkSeconds = 0.0;
+                }
+            }
+            if (maxFps > 0.0)
+            {
+                // An over-budget frame does not accumulate a catch-up burst.
+                std::this_thread::sleep_until(
+                    frameStart + std::chrono::duration<double>(1.0 / maxFps));
+            }
         }
     }
     catch (const std::exception & e)

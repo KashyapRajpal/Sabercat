@@ -22,7 +22,11 @@ CommandBuffer::CommandBuffer(VkDevice device, VkCommandPool pool)
 
 CommandBuffer::~CommandBuffer()
 {
-    // Command buffers are automatically freed when the command pool is destroyed
+    // Resetting a pool resets its command buffers but does not free their
+    // handles. The passes allocate a scoped command buffer per submission
+    // and wait before leaving scope; retaining each until pool destruction
+    // would accumulate allocations (and pool-reset work) every frame.
+    vkFreeCommandBuffers(m_device, m_pool, 1, &m_commandBuffer);
 }
 
 void CommandBuffer::begin(VkCommandBufferUsageFlags flags)

@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 # C is enabled only for examples/c_api_test, which must compile as genuine C
 # to prove the C ABI header (c_api.h) is C-clean.
-project(Sabercat VERSION 1.0.0 LANGUAGES C CXX)
+project(Sabercat VERSION 1.0.1 LANGUAGES C CXX)
 
 # Pre-release suffix for the version string (cmake -DSABERCAT_VERSION_SUFFIX=beta.1).
 # Validated as semver pre-release identifiers. The CMake package version stays

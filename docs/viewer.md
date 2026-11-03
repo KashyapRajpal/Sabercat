@@ -22,6 +22,13 @@ sabercat_viewer.exe [scene] [flags]
 | `--no-validation` | Turn the validation layer off, also in Debug builds. |
 | `--log <path>` | Write the session log to this file instead of the default place. See [Logs and system info](#logs-and-system-info). |
 | `--no-log` | Write no session log file. |
+| `--max-fps <n>` | Limit rendering to at most this many frames per second. Default: 240; 0 disables the limit. |
+| `--diagnostic-seconds <n>` | Log FPS, average forward/present times, maximum frame work time, tile-instance count and relight state once per second; exit after this many seconds of the render loop. 0 disables diagnostics. |
+
+The default frame limit leaves GPU time for the desktop and other applications,
+including when a small scene could render hundreds of times per second. The
+Debug panel shows the active limit. Use `--max-fps 0` for throughput measurements.
+Diagnostic timing starts after scene loading; it cannot interrupt a blocked GPU call.
 
 With no scene argument, the viewer loads the first scene it finds in the
 `assets` folder. See [Scenes](#scenes).
