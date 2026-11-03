@@ -129,11 +129,17 @@ of millions of Gaussians stays interactive.
   `metallic` (and optionally normals) for the Gaussians under it. Falloff is
   radial, weighted by each Gaussian's screen coverage. The brush creates the
   relight streams on first use if the layer lacks them.
-- **Acceleration structure.** Transforms and paint refit the ray-tracing
-  acceleration structure. Delete compaction and duplicate rebuild it.
+- **Acceleration structure and cache.** Edit kernels run inside the renderer,
+  so the renderer records each one as a scene edit. The acceleration
+  structure and cached shadows then stay valid with no call from the app.
+  Transforms and paint refit the structure; delete compaction and duplicate
+  rebuild it. Writes from outside the renderer go through `gaussianViews()`,
+  and the app calls `markSceneChanged()` after each batch. Until that mode
+  exists, such writes disable reuse, as they do today.
 - **Undo** uses the command pattern. Each command stores what it needs to
   invert itself:
-  - transforms store the matrix and the selection;
+  - transforms store a sparse snapshot of the touched Gaussians' prior values,
+    not the matrix. Inverting the matrix in fp32 is not bit-exact;
   - delete and duplicate store the index ranges and the remap;
   - paint and destructive operations store a sparse snapshot of the touched
     Gaussians' prior values, read back from the GPU for the selected indices
