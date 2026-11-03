@@ -7,7 +7,7 @@ between releases. What ships today is in [CHANGELOG.md](CHANGELOG.md) and
 
 | Release | Theme |
 | --- | --- |
-| 1.1 | Evaluation tooling; a sorting study against popping; release packages built in CI; repository checks (headers, secrets, local paths) |
+| 1.1 | Evaluation tooling; a sorting study against popping; release packages built in CI; repository checks (headers, secrets, local paths); Zip64 and an SPZ writer; Studio editing (first part of S2) |
 | 1.5 | Hybrid rendering (triangles and splats together) with dynamic rendering and variable rate shading; a material system; reflections |
 | 2.0 | Volumetric and neural rendering |
 
@@ -39,6 +39,22 @@ Sabercat Studio phases land during 1.x as they are ready (see
   - stochastic transparency: order-independent blending from blue-noise
     samples with temporal reuse and a resolve pass, which avoids sorting
     artifacts at the price of noise.
+
+  The study is time-boxed and ends in a measured report with a
+  recommendation. The default sort does not change in 1.1; the alternatives
+  are opt-in. Stochastic transparency is measured last.
+- **Zip64.** The ZIP reader and writer in `src/renderer/zip_archive.cpp` read
+  and write Zip64, so projects over 4 GiB or with more than 65,534 entries
+  load and save. Archives that fit classic ZIP are written exactly as before.
+- **SPZ writer.** Scenes export to SPZ (the reader exists today).
+- **Trainer-side example.** A small example that drives the backward pass
+  and the C ABI backward views from a training loop.
+- **Studio editing, first part of S2.** GPU layer merge; a selection buffer
+  with box, sphere and rectangle selection and a highlight view; transform
+  (rigid and uniform scale), delete with compaction, and duplicate of the
+  selection; undo and redo with a history panel. Lasso, polygon, brush, the
+  screen-space outline, the transform gizmo and general affine transforms
+  follow in a later 1.x release.
 
 ## 1.5: hybrid rendering and materials
 
@@ -107,7 +123,7 @@ Studio phases are described in [docs/studio-design.md](docs/studio-design.md).
 
 | Phase | Scope | Done when |
 | --- | --- | --- |
-| S2 | Editing: selection tools (rectangle, lasso, polygon, brush, volume), a screen-space outline around the selected splats, transform, delete, duplicate, undo. GPU layer merge, so layer transforms are applied by a kernel instead of on the host | Every operation matches a CPU reference on a synthetic cloud. Undo restores the buffers bit-exactly |
+| S2 | Editing. In 1.1: GPU layer merge (layer transforms applied by a kernel instead of on the host), box, sphere and rectangle selection, transform, delete, duplicate, undo. Later in 1.x: lasso, polygon and brush selection, a screen-space outline around the selected splats, a gizmo | Every operation matches a CPU reference on a synthetic cloud. Undo restores the buffers bit-exactly |
 | S3 | Trainer plugin: time-sliced training and refine-to-photo inside Studio, with an index remap after edits | A capture trains while the viewport stays interactive. Editing during training keeps the optimizer state consistent |
 | S4 | Generation: a generator plugin interface, a sidecar backend, then an in-process backend | One image becomes splats inside Studio. Both backends render the same result within a stated tolerance |
 | S5 | Material painting and relight export: a brush for material parameters (base color, roughness, metallic, normals, and the material system's layers from 1.5), a vendor glTF extension for relight data, and PLY attributes that other 3DGS tools read | A painted, relit scene exports and reloads with identical streams |
@@ -126,22 +142,15 @@ section of [docs/studio-design.md](docs/studio-design.md).
 
 ## Engine
 
-- **Zip64.** The ZIP reader and writer in `src/renderer/zip_archive.cpp`
-  handle only classic ZIP. Archives over 4 GiB, or more than 65,534 entries,
-  are refused. Zip64 removes both limits.
 - **Occlusion culling** in the forward pass. Deferred when the frustum and
   LOD culling landed.
 - **Linux.** Not planned for 1.x; possible later (Vulkan keeps the door open). Only Windows is built, tested and packaged today.
-- **Trainer-side examples.** A small example that drives the backward pass
-  and the C ABI backward views from a training loop, to show the contract end
-  to end.
 
 ## Formats
 
 Writers to add, so scenes leave Sabercat in compressed delivery formats as
 well as PLY and glTF:
 
-- SPZ (Niantic's compressed format; the reader exists today).
 - SOG (PlayCanvas's WebP-based bundle; the reader exists today).
 
 Formats that the readers do not load yet:
@@ -150,8 +159,9 @@ Formats that the readers do not load yet:
   that the cloud already reserves (`GaussianCloud::times`), and its own
   loader.
 - SOG v1, and streamed `lod-meta.json` scenes.
-- `.ksplat` files with spherical harmonics degree 3. The reader supports
-  degrees 0 to 2.
+- `.ksplat` files with spherical harmonics degree 3, if the reference
+  implementation defines a layout for them. It defines degrees 0 to 2 today,
+  and the reader supports those.
 - glTF compression extensions other than SPZ.
 
 ## Not planned
