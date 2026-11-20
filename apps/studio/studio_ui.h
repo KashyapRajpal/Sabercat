@@ -35,6 +35,7 @@ enum class PathPurpose
     AddLayer,
     ExportPly,
     ExportGlb,
+    ExportSpz,
 };
 
 // What a finished native dialog's path is for: the path box (Browse in the

@@ -111,6 +111,10 @@ void startDialogFor(StudioState & state, UiState & ui, PathPurpose purpose, Dial
         started = ui.dialog.startSave(ui.window, app::glbFileFilters(), exportBaseName(state) + ".glb",
                                       "glb", "studio.exportGlb");
         break;
+    case PathPurpose::ExportSpz:
+        started = ui.dialog.startSave(ui.window, app::spzFileFilters(), exportBaseName(state) + ".spz",
+                                      "spz", "studio.exportSpz");
+        break;
     }
     if (started)
     {
@@ -145,9 +149,9 @@ void chooseAddLayer(StudioState & state, UiState & ui)
     startDialogFor(state, ui, PathPurpose::AddLayer, DialogUse::Action);
 }
 
-void chooseExport(StudioState & state, UiState & ui, bool asPly)
+void chooseExport(StudioState & state, UiState & ui, PathPurpose format)
 {
-    startDialogFor(state, ui, asPly ? PathPurpose::ExportPly : PathPurpose::ExportGlb, DialogUse::Action);
+    startDialogFor(state, ui, format, DialogUse::Action);
 }
 
 // Carries out a confirmed path dialog.
@@ -170,6 +174,9 @@ void confirmPath(StudioState & state, Renderer & renderer, UiState & ui, PathPur
         break;
     case PathPurpose::ExportGlb:
         runAction(ui, [&]() { exportGlb(state, path); });
+        break;
+    case PathPurpose::ExportSpz:
+        runAction(ui, [&]() { exportSpz(state, renderer.sabercatDevice(), path); });
         break;
     }
 }
@@ -215,6 +222,8 @@ const char * purposeText(PathPurpose purpose)
         return "PLY file to write (visible layers, world space):";
     case PathPurpose::ExportGlb:
         return "GLB file to write (one node per visible layer):";
+    case PathPurpose::ExportSpz:
+        return "SPZ file to write (visible layers, merged):";
     }
     return "";
 }
@@ -354,11 +363,15 @@ void drawMenuBar(StudioState & state, UiState & ui)
         ImGui::Separator();
         if (ImGui::MenuItem("Export PLY..."))
         {
-            chooseExport(state, ui, /*asPly=*/true);
+            chooseExport(state, ui, PathPurpose::ExportPly);
         }
         if (ImGui::MenuItem("Export GLB..."))
         {
-            chooseExport(state, ui, /*asPly=*/false);
+            chooseExport(state, ui, PathPurpose::ExportGlb);
+        }
+        if (ImGui::MenuItem("Export SPZ..."))
+        {
+            chooseExport(state, ui, PathPurpose::ExportSpz);
         }
         ImGui::EndDisabled();
         ImGui::Separator();
@@ -384,6 +397,10 @@ void drawMenuBar(StudioState & state, UiState & ui)
             if (ImGui::MenuItem("Export GLB..."))
             {
                 openPathDialog(ui, PathPurpose::ExportGlb, "");
+            }
+            if (ImGui::MenuItem("Export SPZ..."))
+            {
+                openPathDialog(ui, PathPurpose::ExportSpz, "");
             }
             ImGui::EndMenu();
         }

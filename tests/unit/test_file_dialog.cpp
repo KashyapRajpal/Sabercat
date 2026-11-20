@@ -111,6 +111,7 @@ void testFilterSpecs(Context & ctx)
     UNIT_CHECK(ctx, app::buildFilterSpecs(app::projectFileFilters())[0].spec == L"*.sabercat");
     UNIT_CHECK(ctx, app::buildFilterSpecs(app::plyFileFilters())[0].spec == L"*.ply");
     UNIT_CHECK(ctx, app::buildFilterSpecs(app::glbFileFilters())[0].spec == L"*.glb");
+    UNIT_CHECK(ctx, app::buildFilterSpecs(app::spzFileFilters())[0].spec == L"*.spz");
 
     // No filters, and a filter with no patterns (which means every file).
     UNIT_CHECK(ctx, app::buildFilterSpecs({}).empty());

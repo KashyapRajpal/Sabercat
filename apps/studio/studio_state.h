@@ -110,6 +110,10 @@ void exportPly(const StudioState & state, Device & device, const std::string & p
 // Throws if none is visible.
 void exportGlb(const StudioState & state, const std::string & path);
 
+// Writes the merged visible layers as one SPZ (the default container, version 3).
+// Throws if none is visible, or if the scene cannot be written (see SPZWriter).
+void exportSpz(const StudioState & state, Device & device, const std::string & path);
+
 // --- App state ------------------------------------------------------------
 
 // The app-state block: orbit camera, SH degree, debug view and the relight
