@@ -334,7 +334,7 @@ layers/<id>/relight/         the layer's relight sidecar, if the cloud has relig
 
 The archive uses stored (uncompressed) entries. The reader also accepts deflated entries.
 
-Zip64 is not supported, in either direction. The reader rejects an archive with zip64 markers or more entries than a standard zip holds.
+Zip64 is read and written. The writer uses it only when a classic zip cannot hold the project: an entry or the archive is over 4 GiB, or there are more than 65,534 entries.
 
 Entries the format does not name are skipped with a warning. This lets a newer writer add entries without breaking this reader.
 
@@ -498,5 +498,4 @@ Studio exports the visible layers. The layer transforms are applied by the expor
 - `.ksplat` files with SH degree 3 are not supported.
 - SOG `meta.json` version 1 and streamed SOG (`lod-meta.json`) are not supported.
 - glTF compression extensions other than `KHR_gaussian_splatting_compression_spz_2` are not supported.
-- Zip64 archives are not supported for projects.
 - The glTF export has no relight data, and the cloud-v1 format has no antialiasing flag. The project file stores that flag.
