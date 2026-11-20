@@ -1194,8 +1194,8 @@ Release, cluster "fly" XXL, 3,506,799 Gaussians, one layer:
 - When every layer is hidden the viewport is empty (Studio calls
   `Renderer::clearScene()`).
 - Loading reads the whole archive into memory.
-- No zip64. An archive over 4 GiB or with more than 65534 entries is refused
-  with an error.
+- The project file is written as Zip64 when it exceeds the classic limits
+  (an entry or the archive over 4 GiB, or more than 65534 entries).
 - The apps use the native Windows file dialogs, with a typed path as the
   fallback when a dialog cannot be shown.
 - Layer merge runs on the host.
