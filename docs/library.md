@@ -48,7 +48,7 @@ toolchain.
 | `sabercat/project.h` | `Project`, `ProjectLayer`, `ProjectIO` |
 | `sabercat/layer_transform.h` | `LayerTransform`, `transformedCopy()`, `mergeLayers()` |
 | `sabercat/ply_reader.h`, `gltf_reader.h`, `splat_reader.h`, `spz_reader.h`, `sog_reader.h`, `ksplat_reader.h`, `cloud_v1_reader.h` | Readers, one class per format |
-| `sabercat/ply_writer.h`, `gltf_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `CloudV1Writer`, `RelightSidecar` |
+| `sabercat/ply_writer.h`, `gltf_writer.h`, `spz_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `SPZWriter`, `CloudV1Writer`, `RelightSidecar` |
 | `sabercat/c_api.h` | The C ABI. See [c-api.md](c-api.md). |
 
 ## Renderer lifecycle
@@ -520,6 +520,7 @@ per-format decisions, including what is rejected, are in
 |---|---|
 | Binary `.ply` (3DGS, with R3DG attributes when relight streams exist) | `PLYWriter::write(cloud, path)` |
 | `.glb` with one node per layer | `GLTFWriter::writeGLB(layers, path)` |
+| `.spz` (quantized; version 3 by default) | `SPZWriter::write(cloud, path, version)` |
 | cloud-v1 directory | `CloudV1Writer::write(cloud, directory)` |
 | cloud-v1 in memory | `CloudV1Writer::encode(cloud)` returns a `FileMap` |
 | relight sidecar (`sabercat.relight-v1`) | `RelightSidecar::encode(cloud)` and `RelightSidecar::decode(files, cloud, label)` |
@@ -530,6 +531,13 @@ host copy was dropped must call `downloadFromGPU()` first.
 `GLTFWriter::writeGLB()` takes `GLTFExportLayer` entries, each with a
 `cloud`, a `LayerTransform` and a name. The output extension is
 `KHR_gaussian_splatting`. Relight streams are not exported to glTF.
+
+`SPZWriter::write()` writes one cloud as a `.spz` file, the inverse of
+`SpzReader::read()`. The container is version 3 (gzip) unless `version` says
+otherwise; version 4 (zstd) is also accepted. Positions must lie within about
++-2048, or the call throws. Other values are quantized and clamped, and the
+call throws on a non-finite value. The rules are in
+[formats.md](formats.md#spz-export).
 
 ## Projects
 
