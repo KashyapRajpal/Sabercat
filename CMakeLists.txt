@@ -275,6 +275,7 @@ add_library(sabercat
     src/renderer/ply_writer.cpp
     src/renderer/splat_reader.cpp
     src/renderer/spz_reader.cpp
+    src/renderer/spz_writer.cpp
     src/renderer/gltf_reader.cpp
     src/renderer/gltf_writer.cpp
     src/renderer/layer_transform.cpp
@@ -422,6 +423,7 @@ if(TARGET zlib)
         sabercat_splat_reader_test
         sabercat_ply_writer_test
         sabercat_spz_reader_test
+        sabercat_spz_writer_test
         sabercat_gltf_reader_test
         sabercat_gltf_writer_test
         sabercat_cloud_v1_reader_test

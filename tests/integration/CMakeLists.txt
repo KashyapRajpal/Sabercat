@@ -38,6 +38,7 @@ set(_sabercat_integration_tests
     sog_reader_test
     splat_reader_test
     spz_reader_test
+    spz_writer_test
     visibility_test
     zip_archive_test
 )
