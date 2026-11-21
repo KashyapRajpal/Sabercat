@@ -16,6 +16,7 @@ set(_sabercat_integration_tests
     c_api_test
     cloud_v1_reader_test
     compute_test
+    debug_view_test
     depth_gradient_test
     depth_output_test
     device_test
