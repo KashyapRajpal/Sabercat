@@ -65,12 +65,13 @@ DebugVisualizer::DebugVisualizer(Device & device, uint32_t width, uint32_t heigh
         storageBufferBinding(6), // shDegrees (SHDegree)
     };
     m_layout = m_descriptors.createLayout(bindings);
-    // One set per frame-in-flight (see record()'s comment on why a single
-    // shared set raced a still-pending command buffer) -- pool sizes scale
-    // by kMaxFramesInFlight accordingly.
-    m_descriptors.createPool(kMaxFramesInFlight,
-                             {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kMaxFramesInFlight},
-                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * kMaxFramesInFlight}});
+    // One set per frame-in-flight (see recordSlot()'s comment on why a single
+    // shared set raced a still-pending command buffer), plus one for the
+    // headless slot (renderHeadless()) -- pool sizes scale by
+    // kMaxFramesInFlight + 1 accordingly.
+    m_descriptors.createPool(kMaxFramesInFlight + 1,
+                             {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * (kMaxFramesInFlight + 1)},
+                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * (kMaxFramesInFlight + 1)}});
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i)
     {
         m_sets[i] = m_descriptors.allocate(m_layout);
@@ -101,6 +102,11 @@ void DebugVisualizer::resize(uint32_t width, uint32_t height)
     m_width = width;
     m_height = height;
 
+    // The headless slot is dropped and recreated lazily at the new size; its
+    // descriptor set is kept and rebound on the next renderHeadless().
+    m_headlessImage.reset();
+    m_headlessBuffer.reset();
+
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i)
     {
         m_firstUse[i] = true;
@@ -117,15 +123,88 @@ void DebugVisualizer::resize(uint32_t width, uint32_t height)
 void DebugVisualizer::record(VkCommandBuffer cmd, DebugView mode, const ForwardPass & forward,
                              float depthScale, float densityScale, uint32_t frameIndex)
 {
-    VkDescriptorSet set = m_sets[frameIndex];
-    Image & displayImage = *m_displayImages[frameIndex];
+    recordSlot(cmd, mode, forward, depthScale, densityScale, m_sets[frameIndex],
+               *m_displayImages[frameIndex], m_firstUse[frameIndex]);
+}
 
+const Buffer & DebugVisualizer::renderHeadless(DebugView mode, const ForwardPass & forward,
+                                               float depthScale, float densityScale,
+                                               VkImageLayout outputLayout)
+{
+    if (!m_headlessImage)
+    {
+        m_headlessImage = std::make_unique<Image>(
+            m_device, m_width, m_height, VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        m_headlessFirstUse = true;
+        if (m_headlessSet == VK_NULL_HANDLE)
+        {
+            m_headlessSet = m_descriptors.allocate(m_layout);
+        }
+        m_descriptors.bindImage(m_headlessSet, 3, m_headlessImage->getImageView(), VK_NULL_HANDLE,
+                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    }
+    if (!m_headlessBuffer)
+    {
+        // RGBA32F, row-major: 16 B/px. Default usage includes TRANSFER_DST.
+        m_headlessBuffer = std::make_unique<Buffer>(
+            m_device, VkDeviceSize(m_width) * m_height * 4 * sizeof(float));
+    }
+    const Buffer & buffer = *m_headlessBuffer;
+
+    // Copies a whole RGBA32F image (in TRANSFER_SRC_OPTIMAL) into the buffer.
+    const auto copyToBuffer = [&](VkCommandBuffer cmd, const Image & image)
+    {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {m_width, m_height, 1};
+        vkCmdCopyImageToBuffer(cmd, image.getHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               buffer.handle(), 1, &region);
+    };
+
+    m_device.immediateSubmit(
+        [&](VkCommandBuffer cmd)
+        {
+            if (mode == DebugView::Final)
+            {
+                // The color image itself: no dispatch.
+                const Image & color = forward.outputImage();
+                if (outputLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                {
+                    color.transitionLayout(cmd, outputLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                }
+                copyToBuffer(cmd, color);
+                color.transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_GENERAL);
+                return;
+            }
+
+            if (outputLayout != VK_IMAGE_LAYOUT_GENERAL)
+            {
+                forward.outputImage().transitionLayout(cmd, outputLayout,
+                                                       VK_IMAGE_LAYOUT_GENERAL);
+            }
+            recordSlot(cmd, mode, forward, depthScale, densityScale, m_headlessSet,
+                       *m_headlessImage, m_headlessFirstUse);
+            // recordSlot leaves the display image in TRANSFER_SRC_OPTIMAL.
+            copyToBuffer(cmd, *m_headlessImage);
+        });
+
+    return buffer;
+}
+
+void DebugVisualizer::recordSlot(VkCommandBuffer cmd, DebugView mode, const ForwardPass & forward,
+                                 float depthScale, float densityScale, VkDescriptorSet set,
+                                 const Image & displayImage, bool & firstUse)
+{
     // Rebind the input images every call -- cheap, and keeps this correct
     // even if ForwardPass recreated them (a resize) since the last record().
     // Safe to rewrite THIS frame's set here: the caller only reaches this
     // call after waiting on this exact frame-in-flight slot's own fence
     // (Renderer::present() does so before recording anything), so no
-    // pending command buffer can still be referencing it.
+    // pending command buffer can still be referencing it. The headless slot
+    // is safe for the same reason: renderHeadless() is synchronous.
     // The buffers are rebound for the same reason: run() grows them
     // (gaussian count, instance count) by reallocating.
     m_descriptors.bindImage(set, 0, forward.outputImage().getImageView(), VK_NULL_HANDLE,
@@ -144,9 +223,9 @@ void DebugVisualizer::record(VkCommandBuffer cmd, DebugView mode, const ForwardP
 
     displayImage.transitionLayout(
         cmd,
-        m_firstUse[frameIndex] ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        firstUse ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_IMAGE_LAYOUT_GENERAL);
-    m_firstUse[frameIndex] = false;
+    firstUse = false;
 
     DebugParams params{};
     params.mode = static_cast<uint32_t>(mode);
