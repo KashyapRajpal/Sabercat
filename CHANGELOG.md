@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- `Renderer::renderDebugView()` and `readDebugView()` render the debug views (alpha, depth, tile density, SH degree, final color) headless as RGBA float images, with `DebugViewScales` for the depth and density display scales. present() shows the same images.
+
 ## [1.0.1] - 2026-11-03
 
 ### Fixed
