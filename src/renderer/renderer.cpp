@@ -34,13 +34,6 @@ namespace sabercat
 namespace
 {
 
-// Rough defaults for the Depth/TileDensity debug views -- there's no scene-
-// bounds tracking to derive a real near/far range from yet, so these are
-// fixed "reasonable scene scale" constants, not measured. Revisit once a
-// real scene makes them feel wrong.
-constexpr float kDebugDepthScale = 50.0f;
-constexpr float kDebugDensityScale = 64.0f;
-
 // Names for the swapchain-format log line; other values print their number.
 std::string surfaceFormatName(VkFormat format)
 {
@@ -196,6 +189,32 @@ class Renderer::Impl
         return last.valid && last.completed && last.mode == ForwardMode::Differentiable;
     }
 
+    // Whether the last forward() (either mode) completed on the current scene
+    // at the current size: what renderDebugView() reads.
+    bool hasCompletedForward() const
+    {
+        if (!forwardPass || !gaussianCloud || !hasRenderedFrame
+            || renderedGeneration != sceneGeneration)
+        {
+            return false;
+        }
+        const ForwardRunRecord & last = forwardPass->lastRun();
+        return last.valid && last.completed;
+    }
+
+    // present(DebugView::Final) leaves the forward color image in
+    // TRANSFER_SRC_OPTIMAL; the debug-view paths expect GENERAL (what forward()
+    // leaves), so they restore it first.
+    void restoreOutputToGeneral(VkCommandBuffer cmd)
+    {
+        if (outputInTransferSrc)
+        {
+            forwardPass->outputImage().transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                        VK_IMAGE_LAYOUT_GENERAL);
+            outputInTransferSrc = false;
+        }
+    }
+
     // Shared precondition + lazy setup for both backward() overloads.
     BackwardPass & prepareBackward()
     {
@@ -215,6 +234,14 @@ class Renderer::Impl
     Camera camera;
     DebugView debugView = DebugView::Final;
     bool hasRenderedFrame = false;
+    // sceneGeneration at the last COMPLETED forward() of either mode
+    // (UINT64_MAX while one runs or none ran). renderDebugView() refuses a
+    // scene that has changed since.
+    uint64_t renderedGeneration = UINT64_MAX;
+    // present(DebugView::Final) leaves the forward color image in
+    // TRANSFER_SRC_OPTIMAL; the debug-view paths expect GENERAL (what forward()
+    // leaves), so they restore it first. Cleared by forward().
+    bool outputInTransferSrc = false;
     bool flipUpAxis = false;
     // Full quality by default -- lowering this is opt-in.
     uint32_t maxSHDegree = kShDegree;
@@ -990,6 +1017,8 @@ void Renderer::forward(RenderMode mode)
 
     const bool differentiable = mode == RenderMode::Differentiable;
     m_impl->differentiableGeneration = UINT64_MAX; // until this run completes
+    m_impl->renderedGeneration = UINT64_MAX;       // until this run completes
+    m_impl->outputInTransferSrc = false;           // run() leaves the color image in GENERAL
     m_impl->forwardPass->run(m_impl->gaussianCloud->views(), uniforms, ForwardStage::Rasterize,
                              differentiable ? ForwardMode::Differentiable : ForwardMode::Viewer);
     if (differentiable)
@@ -997,6 +1026,7 @@ void Renderer::forward(RenderMode mode)
         m_impl->differentiableGeneration = m_impl->sceneGeneration;
     }
     m_impl->hasRenderedFrame = true;
+    m_impl->renderedGeneration = m_impl->sceneGeneration;
 
     // G-buffer + deferred lighting (relighting) over this run's sorted lists.
     m_impl->hasLitFrame = false;
@@ -1494,6 +1524,34 @@ BufferView Renderer::depthView() const
     return view;
 }
 
+BufferView Renderer::renderDebugView(DebugView view, const DebugViewScales & scales)
+{
+    VK_VALIDATE(
+        m_impl->forwardPass && m_impl->debugVisualizer,
+        "Renderer::renderDebugView: the renderer was initialized without a shader directory");
+    VK_VALIDATE(m_impl->hasCompletedForward(),
+                "Renderer::renderDebugView: no completed forward() of the current scene -- call "
+                "forward() first");
+    VK_VALIDATE(static_cast<uint32_t>(view) <= static_cast<uint32_t>(DebugView::SHDegree),
+                "Renderer::renderDebugView: unknown DebugView");
+    VK_VALIDATE(scales.depth > 0.0f && scales.density > 0.0f,
+                "Renderer::renderDebugView: the scales must be positive");
+    const VkImageLayout layout = m_impl->outputInTransferSrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_GENERAL;
+    const Buffer & buffer = m_impl->debugVisualizer->renderHeadless(
+        view, *m_impl->forwardPass, scales.depth, scales.density, layout);
+    m_impl->outputInTransferSrc = false;
+    return buffer.view(sizeof(glm::vec4));
+}
+
+std::vector<float> Renderer::readDebugView(DebugView view, const DebugViewScales & scales)
+{
+    const BufferView v = renderDebugView(view, scales);
+    std::vector<float> out(v.size / sizeof(float));
+    downloadView(m_impl->device, v, out.data(), v.size);
+    return out;
+}
+
 CanonicalGaussianBufferViews Renderer::gaussianViews() const
 {
     VK_VALIDATE(m_impl->gaussianCloud, "Renderer::gaussianViews: no scene loaded");
@@ -1658,13 +1716,16 @@ void Renderer::present()
         }
         else if (m_impl->debugView == DebugView::Final)
         {
+            m_impl->restoreOutputToGeneral(frame.cmd);
             m_impl->forwardPass->prepareOutputForRead(frame.cmd);
+            m_impl->outputInTransferSrc = true;
         }
         else
         {
+            m_impl->restoreOutputToGeneral(frame.cmd);
+            const DebugViewScales scales;
             m_impl->debugVisualizer->record(frame.cmd, m_impl->debugView, *m_impl->forwardPass,
-                                            kDebugDepthScale, kDebugDensityScale,
-                                            m_impl->currentFrame);
+                                            scales.depth, scales.density, m_impl->currentFrame);
             source = &m_impl->debugVisualizer->displayImage(m_impl->currentFrame);
         }
 

@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `SPZWriter::write()` writes `.spz` files, the inverse of `SpzReader`. Container version 3 (gzip) is the default, and version 4 (zstd) is accepted. Positions outside about +-2048 are refused. Scale, opacity, DC color and SH are clamped, with one warning per write.
 - Studio: **Export SPZ...** in the File menu and in the Type a Path submenu. It writes the visible layers as one merged SPZ.
+- `Renderer::renderDebugView()` and `readDebugView()` render the debug views (alpha, depth, tile density, SH degree, final color) headless as RGBA float images, with `DebugViewScales` for the depth and density display scales. present() shows the same images.
 
 ## [1.0.1] - 2026-11-03
 

@@ -439,6 +439,7 @@ if(TARGET zlib)
         sabercat_image_view_test
         sabercat_depth_gradient_test
         sabercat_depth_output_test
+        sabercat_debug_view_test
         sabercat_borrowed_test
         sabercat_relight_test
         sabercat_shadow_test
