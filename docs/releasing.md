@@ -112,12 +112,12 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
 A package must not reveal where the repository lives on the build machine.
 Compilers record absolute paths (`__FILE__` in error messages, PDB paths,
 `FetchContent` sources under the build tree), so the script does not build
-from `D:\GitHub\Sabercat`:
+from the repository root:
 
 - After the preconditions it maps the repository root to the first free
   drive letter from `Z:` down to `M:` (`subst Z: <repo>`) and runs configure,
-  build, test, install and zip from `Z:\`. Every recorded path is then
-  `Z:\src\...`, which says nothing about the machine. The letter itself is
+  build, test, install and zip from `Z:\`. Every recorded path is then <!-- repo-check: allow -->
+  `Z:\src\...`, which says nothing about the machine. The letter itself is <!-- repo-check: allow -->
   irrelevant. git and `gh` still run against the real checkout.
 - The mapping is removed at the end (`subst Z: /D`), also when the release
   fails. If the script is killed hard, run `subst` to see a leftover mapping and
@@ -135,6 +135,45 @@ ignoring case, for the real repository root and `%USERPROFILE%`, each with
 backslashes, forward slashes and doubled backslashes. Any hit prints the file
 and the matched string and fails the release. The bare user name is not
 searched for: it is part of the copyright line.
+
+## Repository checks
+
+`tools/check_repo.py` runs in CI on every push and pull request (workflow
+`.github/workflows/repo-checks.yml`), and locally with
+`python tools/check_repo.py`. It reads every tracked or untracked, non-ignored
+text file and reports:
+
+- **header**: a supported source file (C/C++, shader, PowerShell, CMake, YAML,
+  JavaScript and Python files, and `CMakeLists.txt`) must carry the copyright
+  and `SPDX-License-Identifier: Apache-2.0` lines near its top. Other files,
+  such as Markdown and `tools/package/*.txt`, are exempt from this check.
+- **local-path**: no Windows drive-letter path and no home-folder path
+  (under a `Users` or `home` folder), so a package never reveals the build
+  machine. Checked for every text file.
+- **secret**: no known API token format (AWS, GitHub, Slack, Google and
+  `sk-` keys, PEM private keys) and no hard-coded password, secret, API key or
+  access token literal. Checked for every text file.
+
+Binary files are skipped. A line that carries the marker `repo-check: allow`
+is exempt from the local-path and secret checks on that line only. Use it for
+intentional literals, such as tests. The header check has no exemption.
+
+**Self-test.** `python tools/check_repo.py --self-test` runs built-in fixtures
+through the same checks and fails if any result changes. CI runs it before the
+repository check, so a broken checker cannot pass silently.
+
+**Secret scan.** CI also runs gitleaks over the full git history with
+`gitleaks detect --source . --no-banner --redact`. It uses the official release
+binary, pinned to version 8.30.1. The workflow checks the archive against a
+pinned sha256 and stops on a mismatch. The `gitleaks-action` is not used
+because of its license. To bump gitleaks, take the new version and the sha256
+of the `linux_x64` archive from that release's
+`gitleaks_<version>_checksums.txt`, and update `GITLEAKS_VERSION` and
+`GITLEAKS_SHA256` in `.github/workflows/repo-checks.yml` in one commit.
+
+**GitHub secret scanning.** GitHub's own secret scanning and push protection
+are repository settings, separate from this workflow. The repository owner can
+enable them under Settings > Code security.
 
 ## What the package contains
 

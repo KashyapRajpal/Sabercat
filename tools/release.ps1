@@ -20,15 +20,15 @@
                  point CMAKE_PREFIX_PATH at it for find_package(Sabercat).
                  Empty (the default) skips the refresh.
 
-    Build paths: the repo root is mapped to a free drive letter (`subst X: <repo>`,
-    scanning Z down to M) and everything is configured, built, tested and
-    packaged from X:\, so the compiler and linker see only X:\... and the
-    packages do not embed where the repository lives on the build machine
-    (__FILE__ in error messages, PDB paths, FetchContent paths). The mapping is
-    removed at the end, also on failure. git and gh still run against the real
-    repo. CMake caches absolute paths, so -BuildDir (default out/release-mapped)
-    is only ever configured through the mapped drive; a cache from another
-    letter or path is discarded.
+    Build paths: the repo root is mapped to a free drive letter (subst, scanning
+    Z down to M) and everything is configured, built, tested and packaged from
+    that mapped drive, so the compiler and linker see only paths on the mapped
+    drive and the packages do not embed where the repository lives on the build
+    machine (__FILE__ in error messages, PDB paths, FetchContent paths). The
+    mapping is removed at the end, also on failure. git and gh still run against
+    the real repo. CMake caches absolute paths, so -BuildDir (default
+    out/release-mapped) is only ever configured through the mapped drive; a
+    cache from another letter or path is discarded.
 
     Steps (any failure stops the script; nothing is published unless every
     step before publishing succeeded):

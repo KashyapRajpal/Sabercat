@@ -51,7 +51,7 @@ Add a test for new behavior. A new GPU test is an `examples/<name>_test` program
 
 - **Language**: C++20. The C ABI in `include/sabercat/c_api.h` stays plain C-compatible.
 - **Formatting**: run `clang-format` with the `.clang-format` file at the repository root on the C++ files you change.
-- **License header**: new source files start with the same two-line SPDX header as the existing files (`// Copyright 2026 Kashyap Rajpal` and `// SPDX-License-Identifier: Apache-2.0`, or `#` comments in CMake, PowerShell and YAML).
+- **License header**: new source files start with the same two-line SPDX header as the existing files (`// Copyright 2026 Kashyap Rajpal` and `// SPDX-License-Identifier: Apache-2.0`, or `#` comments in CMake, PowerShell and YAML). CI enforces this (and also rejects committed secrets and absolute local paths) with `python tools/check_repo.py`, which you can run locally. `python tools/check_repo.py --self-test` runs the checker's own fixtures. CI also runs gitleaks over the full history, from a pinned and checksum-verified binary. A line may carry the marker `repo-check: allow` for an intentional literal, such as a test or a doc example.
 - **Naming**:
   - Types: `PascalCase`.
   - Functions and methods: `camelCase`.
