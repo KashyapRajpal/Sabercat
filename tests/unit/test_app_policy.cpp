@@ -134,7 +134,7 @@ void testScenePathList(Context & ctx)
     UNIT_CHECK(ctx, list.size() == 2);
 #ifdef _WIN32
     // Windows paths compare case-insensitively and with either separator.
-    UNIT_CHECK(ctx, app::scenePathKey("C:/Scenes/Room.PLY") == app::scenePathKey("c:\\scenes\\room.ply"));
+    UNIT_CHECK(ctx, app::scenePathKey("C:/Scenes/Room.PLY") == app::scenePathKey("c:\\scenes\\room.ply")); // repo-check: allow
 #endif
 }
 
