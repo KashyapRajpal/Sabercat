@@ -18,8 +18,8 @@ packaged and published. For how consumers use a release, see
   the README in the released commit can link them directly; the hash is in the
   tag and in `manifest.json`.
 - Before a release, update the Download links in README.md to the new
-  version. `-Publish` refuses to run if the README does not link both of the
-  release's zips.
+  version. The build modes (`-PushTag`, `-Publish` and `-CiBuild`) refuse to run
+  if the README does not link both of the release's zips.
 - A beta or other pre-release is tagged `v<version>-<suffix>`, for example
   `v1.0.0-beta.1`. Its GitHub Release is marked as a pre-release. A
   pre-release does not move `stable` and does not refresh `-StableDir`:
@@ -54,11 +54,13 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
 
 ## Cutting a release
 
-1. Batch the work on `main` and commit it. Every commit is clean and
-   builds.
-2. Bump the version (see Versioning) and update CHANGELOG.md, in their own
-   commit.
-3. Dry run:
+0. **Prepare.**
+
+   Commit the batch of work on `main`. Every commit is clean and builds. Then,
+   in their own commit, bump the version (see Versioning), update CHANGELOG.md
+   and update the README download links to the new version.
+
+   A dry run is optional but recommended before step 1:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File tools\release.ps1
@@ -67,12 +69,13 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
    The dry run configures `out/release-mapped`, builds Debug and Release, and runs
    all 30 GPU tests in both configurations. Any non-zero exit, or any
    `[validation]` line, stops it. It then installs both configurations into
-   one prefix, zips the result into `dist/`, unpacks the zip into a fresh
+   one prefix, zips the result into `dist\`, unpacks the zip into a fresh
    directory and runs the packaged self-test from there. Logs are written to
    `out/release-mapped/release-logs/`.
 
    To package uncommitted work for local inspection, add `-AllowDirty`. The zip
-   is then named `...-dirty.zip`, and publishing is refused.
+   is then named `...-dirty.zip`, and the release modes (`-PushTag`, `-Publish`,
+   `-CiBuild`) refuse it.
 
    A beta is the same dry run with a suffix:
 
@@ -80,27 +83,106 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
    powershell -ExecutionPolicy Bypass -File tools\release.ps1 -VersionSuffix beta.1
    ```
 
-   Publish it the same way (below). The tag and both packages carry
+   Release it the same way (steps 1 to 4). The tag and both packages carry
    `1.0.0-beta.1`, and the GitHub Release is a pre-release.
 
-4. Publish:
+1. **Check and tag: `tools\release.ps1 -PushTag`** (optional `-VersionSuffix beta.1`).
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File tools\release.ps1 -Publish
-   ```
+   This is the full local release check. It stops at the first failed check.
+   It checks:
+   - the tree is clean (unless `-AllowDirty`, which this mode refuses anyway);
+   - the tag is new, both locally and on the remote;
+   - `stable` can fast-forward to `HEAD`;
+   - the README links both zips;
+   - it builds Debug and Release from a mapped drive letter (see
+     [Build paths and the leak gate](#build-paths-and-the-leak-gate));
+   - the full GPU test suite passes in both configurations, with zero
+     `[validation]` lines;
+   - the leak gate passes on both zips;
+   - the packaged self-test and the apps self-test pass.
 
-   This repeats the dry run on the committed tree, then:
-   - checks that the tag is new and that `stable` can fast-forward;
-   - moves `stable` and creates the annotated tag;
-   - pushes the current branch, `stable` and the tag to `origin`;
-   - runs `gh release create` with both zips (a pre-release when a suffix is set);
-   - refreshes `-StableDir`, if it was given.
+   Then it creates the annotated tag (the message lists the commits since the
+   previous release) and pushes **only the tag**. It does not push `main` or
+   `stable`, and it creates no GitHub Release. The local zips stay in `dist\`
+   for step 3. If the tag push fails, the local tag is removed again.
+
+2. **Build in CI (automatic on the tag push).**
+
+   `.github/workflows/release.yml` runs on `windows-2022` with
+   `tools\release.ps1 -CiBuild -ExpectTag <tag>`. The runner has no GPU, so it
+   runs the CPU tests and not the GPU tests or the self-tests. The workflow
+   writes `SHA256SUMS.txt`, attests both zips and `SHA256SUMS.txt` (build
+   provenance), and creates or refreshes a **draft** GitHub Release with the
+   files attached. A stale draft's assets are replaced. A published release is
+   never touched: the job stops with an "already published" message.
+
+   CI never publishes.
+
+3. **Verify the draft: `tools\release.ps1 -VerifyCi -Tag vX.Y.Z[-suffix]`.**
+
+   - Finds the draft through the releases API (the by-tag lookup does not
+     return drafts). It fails if there is no draft, or if the release is
+     already published.
+   - Downloads the assets to a fresh temp folder outside the repository.
+   - Checks `SHA256SUMS.txt` against the zips.
+   - Runs `gh attestation verify` for each zip and for `SHA256SUMS.txt`.
+   - Cross-checks the CI zips with the local packages from step 1, using
+     `tools\compare_packages.ps1`:
+     - the same file list;
+     - identical bytes for non-PE files;
+     - for `.exe` and `.dll`, identical import tables and version info; byte
+       differences alone are accepted;
+     - manifest: the same version and commit, `ci=true` and `gpuTested=false`
+       for CI, `ci=false` and `gpuTested=true` for local, the tag matches, and
+       the tree was not dirty.
+     When running the compare script by hand, `-Strict` is also available.
+   - Runs the packaged self-test and the apps self-test on the CI zips (this
+     needs a GPU).
+
+   **Known gap:** the full GPU test suite runs from the build tree, so it runs
+   on the locally built bits in step 1, not on the CI package.
+
+   Without `-Publish`, nothing remote changes.
+
+4. **Publish the draft: `tools\release.ps1 -VerifyCi -Tag vX.Y.Z -Publish`.**
+
+   This runs the same checks as step 3, then publishes the draft (its notes
+   are replaced by the tag message, which lists the commits, because the CI
+   notes say "draft") and fast-forwards `stable`. `stable` moves for final releases only; a
+   pre-release does not move it. If `-StableDir` was given, it is refreshed.
+
+### Fallback: local publish
+
+`tools\release.ps1 -Publish` alone still builds, tests, tags, pushes `main`,
+`stable` and the tag, and creates the GitHub Release with the local zips. Use
+it when CI is unavailable.
+
+Because the tag push still triggers `release.yml`, the workflow builds and then
+stops with the message that the release is already published. That failure is
+expected and harmless.
+
+### Why a tag build can fail
+
+- The tag does not match the version in `CMakeLists.txt`. `-ExpectTag`
+  stops the build.
+- The README in the tagged commit does not link both zips.
+- The build finds a dirty tree or a runner image it does not support.
+
+### Manual verification of a downloaded release
+
+Verify the provenance of a zip with `gh attestation verify <zip> --repo <owner>/<repo>`,
+and compare its SHA-256 with the matching line in `SHA256SUMS.txt`.
 
 ## Script options
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-Publish` | off | Promote to `stable`, tag, push, and create the GitHub Release |
+| `-PushTag` | off | Full local checks (step 1), then create the annotated tag and push only the tag |
+| `-Publish` | off | Legacy. Alone: local publish (build, test, tag, push `main`, `stable` and the tag, create the release with the local zips). With `-VerifyCi`: publish the verified draft |
+| `-VerifyCi` | off | Check the CI draft for `-Tag` (step 3). With `-Publish`, publish it (step 4) |
+| `-Tag` | empty | The tag whose draft `-VerifyCi` checks. Required with `-VerifyCi` |
+| `-CiBuild` | off | CI use only. Builds and packages without a GPU: CPU tests, no GPU tests and no self-tests |
+| `-ExpectTag` | empty | CI use with `-CiBuild`. The build fails unless the tag matches the version in `CMakeLists.txt` and the suffix |
 | `-AllowDirty` | off | Allow an uncommitted tree (dry runs only; the zip is marked `-dirty`) |
 | `-StableDir` | empty | Unpacked package location to refresh on publish. Empty skips the refresh |
 | `-BuildDir` | `out/release-mapped` | Build tree (git-ignored), reused between releases. Only ever configured through the mapped drive (see below) |
@@ -112,16 +194,17 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
 A package must not reveal where the repository lives on the build machine.
 Compilers record absolute paths (`__FILE__` in error messages, PDB paths,
 `FetchContent` sources under the build tree), so the script does not build
-from the repository root:
+from the repository's real location:
 
 - After the preconditions it maps the repository root to the first free
-  drive letter from `Z:` down to `M:` (`subst Z: <repo>`) and runs configure,
-  build, test, install and zip from `Z:\`. Every recorded path is then <!-- repo-check: allow -->
-  `Z:\src\...`, which says nothing about the machine. The letter itself is <!-- repo-check: allow -->
-  irrelevant. git and `gh` still run against the real checkout.
-- The mapping is removed at the end (`subst Z: /D`), also when the release
-  fails. If the script is killed hard, run `subst` to see a leftover mapping and
-  `subst Z: /D` to remove it.
+  drive letter, searching downward from the end of the alphabet
+  (`subst <letter>: <repo>`), and runs configure, build, test, install and zip
+  from `<letter>:\`. Every recorded path is then `<letter>:\src\...`, which says
+  nothing about the machine. The letter itself is irrelevant. git and `gh`
+  still run against the real checkout.
+- The mapping is removed at the end (`subst <letter>: /D`), also when the
+  release fails. If the script is killed hard, run `subst` to see a leftover
+  mapping and `subst <letter>: /D` to remove it.
 - CMake caches absolute source paths and refuses a tree configured from
   another path, so the default build tree is `out/release-mapped`, which is
   only configured through the mapped drive. If its cache was made from a
@@ -188,7 +271,7 @@ The zip has one top-level folder, `sabercat-<version>-win64/`:
 | `docs/` | `consuming.md`, `library.md`, `c-api.md`, `formats.md` |
 | `README.md`, `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `CHANGELOG.md` | At the package root |
 | `selftest/` | `selftest.ps1` and four test executables (Release) |
-| `manifest.json` | Package name, version, tag (publish builds only), commit SHA, branch, dirty flag, build time (UTC), platform, configurations, CMake version, `vulkanSdk` (the SDK path from `$env:VULKAN_SDK`, not a version), and the result of every test |
+| `manifest.json` | Package name, version, `tag` (set by `-PushTag`, `-Publish` and CI builds; empty otherwise), `ci` (true for CI builds), `gpuTested` (true when the GPU suite ran on this build), commit SHA, branch, dirty flag, build time (UTC), platform, configurations, CMake version, `vulkanSdk` (the SDK path from `$env:VULKAN_SDK`, not a version), and the result of every test |
 
 The install step checks that the viewer, the Studio executable, the C DLL,
 the shader config, the package config and one compiled shader are present,
@@ -231,8 +314,8 @@ Each one runs in Debug and Release and must exit 0 with no `[validation]`
 line in its output.
 
 They need a GPU with Vulkan 1.3. They are not run in CI. The CI workflow
-(`.github/workflows/build.yml`) builds, runs the `cpu` tests and checks the install step. So run the tests on a machine
-with a GPU before every release:
+(`.github/workflows/build.yml`) builds, runs the `cpu` tests and checks the install step.
+`-PushTag` runs the full suite (step 1). To run it by hand on a machine with a GPU:
 
 ```powershell
 ctest --test-dir out/release -C Release --output-on-failure
@@ -247,19 +330,27 @@ The self-test in the package runs four of them (`device_test`, `forward_test`,
 - Visual Studio 2022 with the C++ workload.
 - CMake 3.22 or later.
 - The Vulkan SDK 1.3 or later. It provides `slangc` and the validation layer.
-- The GitHub CLI (`gh`), logged in, with rights to create releases on the
-  repository.
+- The GitHub CLI (`gh`), logged in with `gh auth login`. The account needs
+  rights to read and edit releases (drafts included) and to create releases on
+  the repository, and the token must be able to verify attestations.
 - A git remote named `origin` (or the name given by `-Remote`).
 
 ## If something fails
 
-- **Dry run fails at a test:** the log is in `out/release/release-logs/`.
-  Nothing is packaged.
-- **`-Publish` refuses the tag:** the version was not bumped. Bump it in its
-  own commit.
-- **`-Publish` refuses `stable`:** `stable` is not an ancestor of `HEAD`.
+- **Dry run or `-PushTag` fails at a test:** the log is in
+  `out/release-mapped/release-logs/`. Nothing is packaged, and nothing is tagged
+  or pushed.
+- **`-PushTag` or `-Publish` refuses the tag:** the version was not bumped. Bump it
+  in its own commit.
+- **`-PushTag` or `-Publish` refuses `stable`:** `stable` is not an ancestor of `HEAD`.
   `stable` must be an ancestor of the commit being released. Release from
   `main` after its history includes the last released commit.
-- **`gh release create` fails after the tag is pushed:** the tag and branch are
-  already on the remote. Rerun the command the script prints, with the zip and
-  the release notes it names.
+- **`-PushTag` push failed:** the local tag is removed again. Nothing remote
+  changed. Fix the cause (usually the remote or the network) and run it again.
+- **`-VerifyCi` cannot find the draft:** either the workflow is still running or
+  it failed (check the run for the tag on GitHub Actions), or the release is
+  already published, in which case there is nothing to verify (see the
+  fallback above).
+- **`gh release create` fails during `-Publish` after the tag is pushed:** the
+  tag and branch are already on the remote. Rerun the command the script prints,
+  with the zip and the release notes it names.
