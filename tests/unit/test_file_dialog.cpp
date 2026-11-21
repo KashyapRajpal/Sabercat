@@ -66,8 +66,8 @@ void testDefaultExtension(Context & ctx)
     UNIT_CHECK(ctx, app::withDefaultExtension("scene", "") == "scene");
     UNIT_CHECK(ctx, app::withDefaultExtension("scene", ".") == "scene");
     // A dot in a directory name is not the file's extension.
-    UNIT_CHECK(ctx, app::withDefaultExtension("D:\\my.dir\\scene", "sabercat")
-                        == "D:\\my.dir\\scene.sabercat");
+    UNIT_CHECK(ctx, app::withDefaultExtension("D:\\my.dir\\scene", "sabercat") // repo-check: allow
+                        == "D:\\my.dir\\scene.sabercat"); // repo-check: allow
     UNIT_CHECK(ctx, app::withDefaultExtension("my.dir/scene", "sabercat") == "my.dir/scene.sabercat");
     UNIT_CHECK(ctx, app::withDefaultExtension("my.dir/scene.ply", "sabercat") == "my.dir/scene.ply");
     // Non-ASCII names: the separator and dot are ASCII, so the bytes split cleanly.
@@ -171,7 +171,7 @@ std::optional<std::optional<std::string>> pollUntilDelivered(app::AsyncFileDialo
 }
 
 const std::vector<FileFilter> kFilters = {{"Scenes", "*.ply"}};
-const std::string kPath = "C:\\scenes\\room.ply";
+const std::string kPath = "C:\\scenes\\room.ply"; // repo-check: allow
 
 void testAsyncPathDelivered(Context & ctx)
 {
