@@ -18,14 +18,20 @@ set_tests_properties(command_buffer_test PROPERTIES LABELS cpu TIMEOUT 60)
 # Golden-output test for the image comparison CLI. It runs sabercat_compare on
 # fixed fixtures and compares stdout, stderr, the exit code and any PNG it writes
 # byte-for-byte with files captured from a known-good build (see
-# tests/compare_golden/run_golden.cmake).
+# tests/compare_golden/run_golden.cmake). It also compares the decoded pixels of every
+# PNG, with sabercat_compare_png_pixels, and prints that result for each PNG. A full
+# build (the ALL target) builds the pixel tool, so the test needs a full build.
 if(TARGET sabercat_compare)
     include(FetchContent)
     # apps/compare fetches FLIP, but FetchContent sets <name>_SOURCE_DIR only in
     # the directory that made the call. The global property works from here.
     FetchContent_GetProperties(flip SOURCE_DIR flip_source_dir)
+    # Decodes two PNGs with the compare loader and compares the pixels exactly.
+    add_executable(sabercat_compare_png_pixels ${CMAKE_CURRENT_SOURCE_DIR}/../compare_golden/compare_png_pixels.cpp)
+    target_link_libraries(sabercat_compare_png_pixels PRIVATE sabercat_compare_core)
     add_test(NAME test_cli_golden COMMAND ${CMAKE_COMMAND}
         -DEXE=$<TARGET_FILE:sabercat_compare>
+        -DPIXEL_TOOL=$<TARGET_FILE:sabercat_compare_png_pixels>
         -DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/../compare_golden/fixtures
         -DFLIP_IMAGES=${flip_source_dir}/images
         -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/../compare_golden/expected
