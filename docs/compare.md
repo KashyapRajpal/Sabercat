@@ -587,7 +587,7 @@ the linear MSE for LDR, the FLIP mean with `--no-flip`).
   "format": "sabercat.compare-report",
   "formatVersion": 1,
   "savedWith": {
-    "sabercat": "1.0.1"
+    "sabercat": "1.1.0"
   },
   "mode": "hdr",
   "sources": {

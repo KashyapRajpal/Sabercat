@@ -13,7 +13,7 @@ It ships as:
 - `sabercat_viewer`, a scene viewer, and
 - `sabercat_studio`, a layer editor with project files and PLY / GLB / SPZ export.
 
-Sabercat 1.0.1 is the current release. Windows 10/11 (x64) with Visual Studio 2022 is the tested platform.
+Sabercat 1.1.0 is the current release. Windows 10/11 (x64) with Visual Studio 2022 is the tested platform.
 
 ![Sabercat feature reel](docs/media/sabercat-demo.gif)
 
@@ -25,8 +25,8 @@ Prebuilt packages are on the [Releases page](https://github.com/KashyapRajpal/Sa
 
 | Package | For |
 | --- | --- |
-| [sabercat-1.0.1-win64-apps.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.0.1/sabercat-1.0.1-win64-apps.zip) | Trying Sabercat: the Viewer and Studio, ready to run |
-| [sabercat-1.0.1-win64.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.0.1/sabercat-1.0.1-win64.zip) | Developers: the library, C ABI, headers and CMake package (see [docs/consuming.md](docs/consuming.md)) |
+| [sabercat-1.1.0-win64-apps.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.1.0/sabercat-1.1.0-win64-apps.zip) | Trying Sabercat: the Viewer and Studio, ready to run |
+| [sabercat-1.1.0-win64.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.1.0/sabercat-1.1.0-win64.zip) | Developers: the library, C ABI, headers and CMake package (see [docs/consuming.md](docs/consuming.md)) |
 
 You need Windows 10 or 11 (x64) and a GPU driver with Vulkan 1.3. Unzip the apps package and run `bin\Release\sabercat_viewer.exe` or `bin\Release\sabercat_studio.exe`. `README.txt` in the zip covers how to run the apps and where to report problems.
 

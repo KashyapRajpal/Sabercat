@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-22
+
 ### Added
 
 - Zip64 support in the project archive reader and writer (`src/renderer/zip_archive.cpp`). Projects over 4 GiB or with more than 65,534 entries now load and save. The writer uses Zip64 only when a classic zip cannot hold the project, so classic ZIP output is unchanged.
@@ -82,6 +84,7 @@ First public release.
 
 Numerical behavior is covered by `forward_regression_test`, which stores hashes of the forward output. Any change that alters a stored hash gets an entry under Numerics in the release that makes it.
 
-[Unreleased]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/KashyapRajpal/Sabercat/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/KashyapRajpal/Sabercat/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/KashyapRajpal/Sabercat/releases/tag/v1.0.0
