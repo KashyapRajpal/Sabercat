@@ -131,6 +131,13 @@ struct OrbitCamera
     }
 };
 
+// The mouse part of updateOrbitCamera, on explicit inputs so a caller that
+// knows which pane the pointer is over can decide whether it applies. deltaX/
+// deltaY are cursor movement in pixels since the last frame. `orbit` takes
+// precedence over `pan` (left button over right, as the viewer does). `wheel`
+// is the scroll amount in notches; 0 leaves the distance alone.
+void applyOrbitMouse(OrbitCamera & cam, float deltaX, float deltaY, bool orbit, bool pan, float wheel);
+
 // Polls mouse/keyboard each frame (matching the V-key polling style already
 // used for the debug view) rather than installing GLFW callbacks -- avoids
 // having to chain through Dear ImGui's own installed callbacks
