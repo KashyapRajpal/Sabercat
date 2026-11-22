@@ -24,8 +24,10 @@ class ForwardPass;
 // Presentation-only debug views (see DebugView in renderer.h). Reads
 // buffers ForwardPass already produced and writes a normalized RGBA image
 // for Renderer::present() to blit -- never runs for DebugView::Final,
-// which blits ForwardPass's own output image directly instead. Owned by
-// Renderer, not ForwardPass: this is a viewer/debug concern, not part of
+// which blits ForwardPass's own output image directly instead. Also owns
+// one headless slot (renderHeadless()) that present() never touches, so
+// a headless render can never race present()'s per-frame resources. Owned
+// by Renderer, not ForwardPass: this is a viewer/debug concern, not part of
 // the differentiable rasterizer; the two are kept separate.
 class DebugVisualizer
 {
@@ -66,7 +68,26 @@ class DebugVisualizer
         return *m_displayImages[frameIndex];
     }
 
+    // Headless: renders `mode` over `forward`'s last run into a private slot
+    // (separate from the per-frame ones, so it can never race present()) and
+    // returns the result as width*height RGBA32F floats in a device buffer
+    // (row-major, 16 B/px). The slot (descriptor set, display image, buffer)
+    // is created on the first call. Synchronous: one Device::immediateSubmit.
+    // `outputLayout` is the layout forward's COLOR image is in now (GENERAL,
+    // or TRANSFER_SRC_OPTIMAL after present() blitted it); it is left in
+    // GENERAL. DebugView::Final copies the color image itself; no dispatch.
+    // The returned buffer is reused and stays valid until the next call or
+    // resize().
+    const Buffer & renderHeadless(DebugView mode, const ForwardPass & forward, float depthScale,
+                                  float densityScale, VkImageLayout outputLayout);
+
   private:
+    // The body of record(), for any descriptor set / display image pair: the
+    // per-frame slots and the headless slot both go through it.
+    void recordSlot(VkCommandBuffer cmd, DebugView mode, const ForwardPass & forward,
+                    float depthScale, float densityScale, VkDescriptorSet set,
+                    const Image & displayImage, bool & firstUse);
+
     Device & m_device;
     uint32_t m_width;
     uint32_t m_height;
@@ -79,6 +100,12 @@ class DebugVisualizer
     DescriptorSet m_descriptors;
     VkDescriptorSetLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorSet m_sets[kMaxFramesInFlight] = {};
+    // Headless slot (renderHeadless()): one extra set, display image and
+    // readback buffer, created lazily and recreated on resize().
+    VkDescriptorSet m_headlessSet = VK_NULL_HANDLE;
+    std::unique_ptr<Image> m_headlessImage;
+    std::unique_ptr<Buffer> m_headlessBuffer;
+    bool m_headlessFirstUse = true;
     Pipeline m_pipeline;
 };
 

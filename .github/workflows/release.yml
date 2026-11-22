@@ -1,0 +1,262 @@
+# Copyright 2026 Kashyap Rajpal
+# SPDX-License-Identifier: Apache-2.0
+
+name: release
+
+# Builds the release packages for a version tag on a clean hosted runner, attests
+# them, and leaves a DRAFT GitHub Release for a maintainer to check.
+#
+# CI never publishes. The maintainer checks the draft with
+#   tools/release.ps1 -VerifyCi -Tag <tag>
+# (downloads the draft assets, checks SHA256SUMS.txt and the attestations, runs
+# the packaged self-tests on a GPU machine, cross-checks against the locally
+# built packages) and publishes it with the same command plus -Publish.
+# GPU tests are not run here: hosted GitHub runners have no GPU. The full GPU
+# suite runs locally on the tagged commit (see docs/releasing.md).
+
+on:
+  push:
+    # Matches vMAJOR.MINOR.PATCH and also vMAJOR.MINOR.PATCH-SUFFIX (for example
+    # v1.1.0-beta.1). The tag is checked again by the "Parse the tag" step.
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+
+# Nothing at the top level. Each job asks for only what it needs.
+permissions: {}
+
+# One release run per tag at a time. A running release is never cancelled,
+# because cancelling it in the middle of a draft upload could leave a partial
+# release behind.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Pinned, as in build.yml: the build uses the "Visual Studio 17 2022"
+    # generator, which windows-latest no longer ships.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      # Read by the draft-release job to choose between a normal and a
+      # pre-release draft.
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      # Recursive, because external/ holds submodules (spz, and others).
+      # persist-credentials is off: nothing after this step pushes to git, and
+      # the token should not stay in the workspace.
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # Same SDK version and action pin as build.yml, so the packages are built
+      # with the toolchain the local builds use.
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
+        with:
+          vulkan_version: 1.4.309.0
+
+      # The tag is the only input that sets the version, so it is checked here
+      # with a fixed pattern before it reaches any build script. The suffix (if
+      # any) and the pre-release flag are passed on as step outputs.
+      - name: Parse the tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          # [0-9] rather than \d: \d also matches non-ASCII digits.
+          $m = [regex]::Match($tag, '^v([0-9]+\.[0-9]+\.[0-9]+)(?:-([0-9A-Za-z.-]+))?$')
+          if (-not $m.Success) {
+            Write-Host "::error::Tag '$tag' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-SUFFIX."
+            exit 1
+          }
+          $suffix = $m.Groups[2].Value
+          if ($suffix) { $prerelease = 'true' } else { $prerelease = 'false' }
+          # Written as UTF-8 without a BOM, which GITHUB_OUTPUT expects.
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "suffix=$suffix" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "prerelease=$prerelease" -Encoding utf8
+
+      # release.ps1 checks that the tag matches CMakeLists.txt, that the tree is
+      # clean and that the README download links exist, then writes the zips to
+      # dist/. The suffix goes in through env, not by writing it into the script,
+      # and the argument list is built as an array so nothing is re-parsed.
+      - name: Build packages
+        shell: pwsh
+        env:
+          RELEASE_SUFFIX: ${{ steps.tag.outputs.suffix }}
+        run: |
+          $psArgs = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'tools/release.ps1',
+            '-CiBuild', '-ExpectTag', $env:GITHUB_REF_NAME
+          )
+          if ($env:RELEASE_SUFFIX) {
+            $psArgs += @('-VersionSuffix', $env:RELEASE_SUFFIX)
+          }
+          & powershell @psArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "tools/release.ps1 failed with exit code $LASTEXITCODE"
+          }
+
+      # The sums file is made here, on the same runner that built the zips, so
+      # the draft-release job can check the attested zips against it. The format
+      # is the one sha256sum writes: "<hash>  <name>", lowercase hex, LF lines.
+      - name: Write SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $zips = @(Get-ChildItem -LiteralPath 'dist' -Filter '*.zip' | Sort-Object Name)
+          if ($zips.Count -eq 0) {
+            throw 'No zip files found in dist/.'
+          }
+          $lines = foreach ($zip in $zips) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip.FullName).Hash.ToLowerInvariant()
+            "$hash  $($zip.Name)"
+          }
+          $text = ($lines -join "`n") + "`n"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'dist/SHA256SUMS.txt'), $text, $utf8NoBom)
+          Get-Content -LiteralPath 'dist/SHA256SUMS.txt'
+
+      # Overwrite is on, so a failed tag build can be run again and replace its
+      # own artifacts. Retention is short: the draft release keeps the real copy.
+      - name: Upload packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+      # Uploaded even when the build fails, so a failed release can be
+      # diagnosed without rerunning it.
+      - name: Upload release logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-logs
+          path: out/release-mapped/release-logs
+          overwrite: true
+          retention-days: 14
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Write access is needed for the release. id-token and attestations are
+    # needed to sign the build-provenance attestations. Nothing else is granted.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # Downloads the artifact contents straight into dist/.
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: packages
+          path: dist
+
+      # Signs a provenance attestation for each zip and for SHA256SUMS.txt. Users
+      # check them with "gh attestation verify". The check is done after the
+      # build, against the files that the draft release will carry.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+
+      # Creates the draft release, or refreshes an existing draft. A release that
+      # is already published is never touched: CI stops with an error. No
+      # checkout is needed, because gh works from GH_REPO and --verify-tag checks
+      # the tag on GitHub.
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # Release notes. The heredoc is unquoted on purpose, so $TAG, $SHA and
+          # $GH_REPO are filled in. The text has no backticks or dollar signs.
+          notes="$RUNNER_TEMP/notes.md"
+          cat > "$notes" <<EOF
+          Sabercat $TAG, built by CI from commit $SHA on a clean runner.
+
+          This is a DRAFT. It is not verified and not published yet.
+
+          - GPU tests are NOT run in CI. The maintainer runs them locally on this
+            commit before publishing.
+          - To verify a download, run "gh attestation verify <zip> --repo $GH_REPO"
+            on each zip and on SHA256SUMS.txt, and compare each zip's SHA-256 with
+            SHA256SUMS.txt.
+          - The maintainer checks the draft with tools/release.ps1 -VerifyCi -Tag $TAG,
+            then publishes it with the same command plus -Publish.
+          EOF
+
+          # The by-tag lookup does not return drafts, so the releases are listed
+          # instead. One line per match: "<id> <draft>". A failed API call stops
+          # the job here (set -e), with gh's own message.
+          found=$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq '.[] | select(.tag_name==env.TAG) | "\(.id) \(.draft)"')
+          n=$(printf '%s' "$found" | grep -c . || true)
+
+          if [ "$n" -eq 0 ]; then
+            flags=()
+            if [ "$PRERELEASE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            echo "No release for $TAG yet. Creating a draft."
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+              --draft --verify-tag --title "Sabercat $TAG" --notes-file "$notes" \
+              "${flags[@]}"
+          elif [ "$n" -gt 1 ]; then
+            echo "::error::More than one release has the tag $TAG, so it is ambiguous. Nothing was changed. Delete the extra release(s) on GitHub, then run this again." >&2
+            exit 1
+          else
+            read -r id draft <<< "$found"
+            if [ "$draft" != "true" ]; then
+              echo "::error::Release $TAG is already published, so CI will not change it. It was probably published with the local fallback (release.ps1 -Publish). Nothing was changed. To use the CI flow, use a new tag." >&2
+              exit 1
+            fi
+            echo "Draft release $TAG (id $id) exists. Replacing its assets and notes."
+
+            # Keep only the assets whose names are in the new set, delete the
+            # rest, then upload the new set over the kept ones (--clobber).
+            new_names=()
+            for f in dist/*.zip dist/SHA256SUMS.txt; do
+              if [ ! -f "$f" ]; then
+                echo "::error::Missing $f." >&2
+                exit 1
+              fi
+              new_names+=("$(basename "$f")")
+            done
+            assets=$(gh api "repos/$GH_REPO/releases/$id/assets" --paginate \
+              --jq '.[] | "\(.id) \(.name)"')
+            while read -r aid aname; do
+              if [ -z "$aid" ]; then
+                continue
+              fi
+              keep=false
+              for k in "${new_names[@]}"; do
+                if [ "$k" = "$aname" ]; then
+                  keep=true
+                fi
+              done
+              if [ "$keep" = false ]; then
+                echo "Deleting stale asset $aname"
+                gh api -X DELETE "repos/$GH_REPO/releases/assets/$aid"
+              fi
+            done <<< "$assets"
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+            gh api -X PATCH "repos/$GH_REPO/releases/$id" -F "body=@$notes" > /dev/null
+            echo "Draft release $TAG updated."
+          fi

@@ -48,7 +48,7 @@ toolchain.
 | `sabercat/project.h` | `Project`, `ProjectLayer`, `ProjectIO` |
 | `sabercat/layer_transform.h` | `LayerTransform`, `transformedCopy()`, `mergeLayers()` |
 | `sabercat/ply_reader.h`, `gltf_reader.h`, `splat_reader.h`, `spz_reader.h`, `sog_reader.h`, `ksplat_reader.h`, `cloud_v1_reader.h` | Readers, one class per format |
-| `sabercat/ply_writer.h`, `gltf_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `CloudV1Writer`, `RelightSidecar` |
+| `sabercat/ply_writer.h`, `gltf_writer.h`, `spz_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `SPZWriter`, `CloudV1Writer`, `RelightSidecar` |
 | `sabercat/c_api.h` | The C ABI. See [c-api.md](c-api.md). |
 
 ## Renderer lifecycle
@@ -183,8 +183,9 @@ Owned GPU buffers are freed. A borrowed scene's buffers stay yours. Afterwards:
 - `gaussianCount()` is 0 and `sceneBounds().valid` is false.
 - `storageGeneration()` has advanced.
 - `forward()` is a no-op.
-- `readImage()`, `imageView()`, `readDepth()`, `depthView()`, `readLitImage()`
-  and `backward()` throw until a `forward()` of a new scene.
+- `readImage()`, `imageView()`, `readDepth()`, `depthView()`, `readLitImage()`,
+  `renderDebugView()`, `readDebugView()` and `backward()` throw until a
+  `forward()` of a new scene.
 - `present()` shows the clear color.
 
 The camera, lights and other settings are kept. A scene set afterwards
@@ -283,6 +284,7 @@ renderer.backward(lossGradientView);                   // sabercat::BufferView
 | `backward(const BufferView &, const BufferView &)` | As above, with dL/d(depth) from a device buffer |
 | `imageView()` | The last differentiable forward's image as a device buffer |
 | `readDepth()`, `depthView()` | The last differentiable forward's depth output, as a host copy or a device buffer |
+| `renderDebugView()`, `readDebugView()` | A debug view (alpha, depth, tile density, SH degree, or the final color) of the last forward, as a device buffer or a host copy. See [Debug views](#debug-views). |
 | `readGradients()` | Host copy as `GaussianGradients` |
 | `gaussianViews()`, `gradientViews()` | Device views of the parameter and gradient streams |
 
@@ -361,6 +363,45 @@ renderer.backward(dLdImage.data(), dLdDepth.data());
   backward exactly.
 - Throws if a depth gradient is given and the layout is `DepthLayout::None`.
 - Gradients are overwritten, as with the color-only backward.
+
+### Debug views
+
+The viewer's debug views are available headless. `renderDebugView()` runs one
+of them over the last `forward()` and returns a device buffer. `readDebugView()`
+returns the same image as a host copy. Either works after a `Viewer` or a
+`Differentiable` forward.
+
+```cpp
+renderer.forward(sabercat::RenderMode::Viewer);
+std::vector<float> density = renderer.readDebugView(sabercat::DebugView::TileDensity);
+sabercat::DebugViewScales scales;
+scales.depth = 10.0f;
+std::vector<float> depth = renderer.readDebugView(sabercat::DebugView::Depth, scales);
+```
+
+| `DebugView` | Shows | Scale |
+|---|---|---|
+| `Final` | The forward color image, the `readImage()` values (not the lit image) | None |
+| `Alpha` | Coverage, as grayscale | None |
+| `Depth` | Front depth, as grayscale | `scales.depth`, default 50 |
+| `TileDensity` | Instances per tile, from blue (empty) to red (dense) | `scales.density`, default 64 |
+| `SHDegree` | Effective SH degree per pixel, from blue (0) through green and yellow to red (3), scaled by coverage | None |
+
+- The output is `width * height` RGBA floats, row-major, stride 16 bytes. It
+  is display-referred and is what `present()` shows for that view with the
+  same scales. Alpha is 1 except in `Final`.
+- `Depth` does not need a depth layout. `DebugViewScales` holds the two
+  display scales, and both must be positive.
+- The calls do not re-run `forward()` and write nothing that `forward()` or
+  `backward()` reads. They may be called any number of times, and after
+  `present()`.
+- They throw before any `forward()`, after a scene change, `clearScene()` or
+  a resize, until the next `forward()`, and with a scale that is not positive.
+- One buffer is reused. It is allocated on the first call, so an application
+  that never calls these allocates nothing. Its handle is stable across calls
+  and changes only on a resize. Its contents are valid until the next
+  `renderDebugView()` or `readDebugView()` call, the next resize, or
+  `shutdown()`. Like every call, they are synchronous.
 
 ### Densification
 
@@ -520,6 +561,7 @@ per-format decisions, including what is rejected, are in
 |---|---|
 | Binary `.ply` (3DGS, with R3DG attributes when relight streams exist) | `PLYWriter::write(cloud, path)` |
 | `.glb` with one node per layer | `GLTFWriter::writeGLB(layers, path)` |
+| `.spz` (quantized; version 3 by default) | `SPZWriter::write(cloud, path, version)` |
 | cloud-v1 directory | `CloudV1Writer::write(cloud, directory)` |
 | cloud-v1 in memory | `CloudV1Writer::encode(cloud)` returns a `FileMap` |
 | relight sidecar (`sabercat.relight-v1`) | `RelightSidecar::encode(cloud)` and `RelightSidecar::decode(files, cloud, label)` |
@@ -530,6 +572,13 @@ host copy was dropped must call `downloadFromGPU()` first.
 `GLTFWriter::writeGLB()` takes `GLTFExportLayer` entries, each with a
 `cloud`, a `LayerTransform` and a name. The output extension is
 `KHR_gaussian_splatting`. Relight streams are not exported to glTF.
+
+`SPZWriter::write()` writes one cloud as a `.spz` file, the inverse of
+`SpzReader::read()`. The container is version 3 (gzip) unless `version` says
+otherwise; version 4 (zstd) is also accepted. Positions must lie within about
++-2048, or the call throws. Other values are quantized and clamped, and the
+call throws on a non-finite value. The rules are in
+[formats.md](formats.md#spz-export).
 
 ## Projects
 
@@ -709,6 +758,9 @@ buffers. It is the rule set for both owned and borrowed devices.
   changes only when the image is resized. Its contents are valid from
   `forward()` returning until the next `forward()`. `depthView()` follows the
   same rules.
+- **Debug view.** `renderDebugView()` returns one reused buffer. Its handle is
+  stable and changes only on a resize. Its contents are valid until the next
+  `renderDebugView()` or `readDebugView()` call, or the next resize.
 - **Borrowed device.** `computeQueue()` is the queue you lent. If you lent only
   a graphics queue, that queue is used.
 

@@ -11,7 +11,7 @@ It ships as:
 - `Sabercat::sabercat`, a C++ library,
 - `Sabercat::sabercat_c`, a C ABI DLL,
 - `sabercat_viewer`, a scene viewer, and
-- `sabercat_studio`, a layer editor with project files and PLY / GLB export.
+- `sabercat_studio`, a layer editor with project files and PLY / GLB / SPZ export.
 
 Sabercat 1.0.1 is the current release. Windows 10/11 (x64) with Visual Studio 2022 is the tested platform.
 
@@ -38,10 +38,11 @@ You need Windows 10 or 11 (x64) and a GPU driver with Vulkan 1.3. Unzip the apps
 | Training support | Backward pass that returns gradients for the Gaussian parameters (fp32 atomics), including gradients from a depth loss |
 | Lighting | Relighting with directional, point and rectangle lights and an environment light, ray-traced shadows (needs ray query), visibility bake |
 | Scene formats (read) | PLY, `.splat`, SPZ, `.ksplat`, SOG (`.sog` bundle or `meta.json`), glTF / GLB with `KHR_gaussian_splatting`, cloud-v1 directory |
-| Scene formats (write) | PLY, GLB (glTF with `KHR_gaussian_splatting`), cloud-v1 directory |
+| Scene formats (write) | PLY, GLB (glTF with `KHR_gaussian_splatting`), SPZ, cloud-v1 directory |
 | Projects | `.sabercat` project files with layers and layer transforms |
 | Integration | Owned or borrowed Vulkan device, stable C ABI with `struct_size` versioning, CMake package |
 | Applications | Viewer with orbit camera, drag and drop, and an ImGui debug panel; Studio with layers, inspector, project save / open, and export |
+| Tools | `sabercat_compare`: PSNR, FLIP and HDR-FLIP between two images (PNG, JPEG, WebP, EXR), with error maps ([docs/compare.md](docs/compare.md)). It also opens a window for comparing images (split, wipe, flicker, difference, probe, GPU PSNR/MSE, projects, exports). |
 
 ## Design highlights
 

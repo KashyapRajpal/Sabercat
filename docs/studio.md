@@ -3,7 +3,7 @@
 `sabercat_studio` edits a scene made of layers. Each layer is one
 Gaussian cloud with its own position, rotation and scale. You can show,
 hide, lock, reorder, move and rename layers. You save the result as a
-`.sabercat` project, or export it as one PLY or one glTF (GLB) file.
+`.sabercat` project, or export it as one PLY, one glTF (GLB) or one SPZ file.
 
 Studio is in an early stage. It does not edit individual Gaussians yet. See
 the known limitations at the end of this page, and
@@ -102,7 +102,8 @@ file, choose **Open with > Choose another app**, pick Studio, and tick **Always*
 | Add Layer... | | Picks a scene file in the Windows Open dialog and adds it as a new layer. A cloud-v1 scene is added by its `manifest.json`. |
 | Export PLY... | | Picks where to write the visible layers as one PLY. The name starts as `<project>.ply`. |
 | Export GLB... | | Picks where to write the visible layers as one GLB. The name starts as `<project>.glb`. |
-| Type a Path | | Submenu: Open project, Save project as, Add layer, Export PLY and Export GLB, each in the path box (see below). |
+| Export SPZ... | | Picks where to write the visible layers as one SPZ, merged. The name starts as `<project>.spz`. |
+| Type a Path | | Submenu: Open project, Save project as, Add layer, Export PLY, Export GLB and Export SPZ, each in the path box (see below). |
 | Quit | | Closes Studio. Asks first if there are unsaved changes. |
 
 Closing the window also asks first if there are unsaved changes.
@@ -227,9 +228,11 @@ file. A failed save leaves the old file in place.
 |--------|----------|
 | PLY | The visible layers merged into one binary PLY, in world space. |
 | GLB | One glTF node per visible layer, with its name and transform. The Gaussians use the `KHR_gaussian_splatting` extension. |
+| SPZ | The visible layers merged into one SPZ, in world space. The file is quantized, so positions are kept to about 1/8192. |
 
-Both exports fail with the error *No visible layers to export* when no layer
-is visible. Nothing is written in that case.
+All three exports fail with the error *No visible layers to export* when no layer
+is visible. Nothing is written in that case. SPZ also refuses a scene whose positions
+lie outside about +-2048.
 
 Exports use the layers' current state. Hidden layers are not included.
 Export format details are in [formats.md](formats.md).
@@ -246,10 +249,11 @@ The self-test runs without a window. It:
    synthetic two-layer project instead (different SH degrees, one layer moved
    and carrying relight streams), so `ctest -L gpu` needs no asset files.
 2. Opens the project again and checks that it matches the original exactly.
-3. Exports a PLY and a GLB into `outDir`.
-4. Reads the GLB back and compares it with the merged layers. With no scenes,
+3. Exports a PLY, a GLB and an SPZ into `outDir`.
+4. Reads the GLB back and compares it with the merged layers. Reads the SPZ back
+   and compares its positions with the merged layers, within 1.3e-4. With no scenes,
    the PLY is compared the same way, within the tolerances of the PLY writer
-   test, and the export is refused when no layer is visible.
+   test, and the export is refused when no layer is visible (PLY, GLB and SPZ).
 5. Renders one frame and checks that some pixels are covered.
 
 It prints `studio selftest OK` and exits with 0 on success. On failure it

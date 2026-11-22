@@ -11,6 +11,7 @@
 #include "sabercat/ply_writer.h"
 #include "sabercat/renderer.h"
 #include "sabercat/scene_loader.h"
+#include "sabercat/spz_writer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -483,6 +484,18 @@ void exportPly(const StudioState & state, Device & device, const std::string & p
     const std::shared_ptr<GaussianCloud> merged = mergeLayers(device, visible);
     PLYWriter::write(*merged, path);
     Logger::info("Studio: exported PLY " + path);
+}
+
+void exportSpz(const StudioState & state, Device & device, const std::string & path)
+{
+    const auto visible = visibleLayers(state);
+    if (visible.empty())
+    {
+        throw std::runtime_error("No visible layers to export");
+    }
+    const std::shared_ptr<GaussianCloud> merged = mergeLayers(device, visible);
+    SPZWriter::write(*merged, path);
+    Logger::info("Studio: exported SPZ " + path);
 }
 
 void exportGlb(const StudioState & state, const std::string & path)
