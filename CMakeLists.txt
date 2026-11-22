@@ -415,6 +415,7 @@ if(TARGET zlib)
     set(_sabercat_dll_consumers
         sabercat_viewer
         sabercat_studio
+        sabercat_compare
         sabercat_triangle
         sabercat_hello_sabercat
         sabercat_device_test
