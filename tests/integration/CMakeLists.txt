@@ -72,3 +72,14 @@ if(TARGET sabercat_studio)
     set_tests_properties(studio_selftest PROPERTIES LABELS gpu TIMEOUT 900
         FAIL_REGULAR_EXPRESSION "\\[validation\\]")
 endif()
+
+# The compare window's headless self-test: the GPU metric and compositor against the CPU
+# reference, the device copies, and the PNG and report exports. Needs the compare app;
+# the output directory is per configuration.
+if(TARGET sabercat_compare)
+    add_test(NAME compare_selftest
+        COMMAND $<TARGET_FILE:sabercat_compare> --selftest
+                ${CMAKE_BINARY_DIR}/tests/compare_selftest-$<CONFIG>)
+    set_tests_properties(compare_selftest PROPERTIES LABELS gpu TIMEOUT 900
+        FAIL_REGULAR_EXPRESSION "\\[validation\\]")
+endif()

@@ -81,6 +81,57 @@ const char * debugViewName(DebugView view)
     return "?";
 }
 
+const DebugViewInfo * findDebugView(const char * name)
+{
+    if (name == nullptr)
+    {
+        return nullptr;
+    }
+    for (const DebugViewInfo & info : kDebugViews)
+    {
+        if (std::strcmp(info.name, name) == 0)
+        {
+            return &info;
+        }
+    }
+    return nullptr;
+}
+
+const char * debugViewKey(DebugView view)
+{
+    switch (view)
+    {
+    case DebugView::Final:
+        return "final";
+    case DebugView::Alpha:
+        return "alpha";
+    case DebugView::Depth:
+        return "depth";
+    case DebugView::TileDensity:
+        return "tileDensity";
+    case DebugView::SHDegree:
+        return "shDegree";
+    }
+    return "?";
+}
+
+bool parseDebugViewKey(const char * key, DebugView & view)
+{
+    if (key == nullptr)
+    {
+        return false;
+    }
+    for (const DebugView candidate : kDebugViewCycle)
+    {
+        if (std::strcmp(debugViewKey(candidate), key) == 0)
+        {
+            view = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 void checkVkResult(VkResult result)
 {
     VK_VALIDATE(result == VK_SUCCESS, "Dear ImGui Vulkan backend call failed");

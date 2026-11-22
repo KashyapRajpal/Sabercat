@@ -19,6 +19,16 @@ void testSystemInfo(Context & ctx);
 void testFileDialog(Context & ctx);
 void testFileAssociation(Context & ctx);
 void testSurfaceFormat(Context & ctx);
+#ifdef SABERCAT_HAVE_COMPARE
+void testImageCompare(Context & ctx);
+void testCompareLaunchMode(Context & ctx);
+void testCompareLoaders(Context & ctx);
+void testCompareTimeline(Context & ctx);
+void testCompareProject(Context & ctx);
+void testCompareLayout(Context & ctx);
+void testCompareFlipHdr(Context & ctx);
+void testCompareReport(Context & ctx);
+#endif
 
 } // namespace sabercat::unit
 
@@ -39,6 +49,16 @@ int main()
         {"file dialog helpers", sabercat::unit::testFileDialog},
         {"file association", sabercat::unit::testFileAssociation},
         {"swapchain format choice", sabercat::unit::testSurfaceFormat},
+#ifdef SABERCAT_HAVE_COMPARE
+        {"image comparison", sabercat::unit::testImageCompare},
+        {"compare launch mode", sabercat::unit::testCompareLaunchMode},
+        {"compare loaders", sabercat::unit::testCompareLoaders},
+        {"compare timeline", sabercat::unit::testCompareTimeline},
+        {"compare project file", sabercat::unit::testCompareProject},
+        {"compare layout", sabercat::unit::testCompareLayout},
+        {"compare FLIP HDR and filters", sabercat::unit::testCompareFlipHdr},
+        {"compare report", sabercat::unit::testCompareReport},
+#endif
     };
 
     Context ctx;

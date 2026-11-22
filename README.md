@@ -42,6 +42,7 @@ You need Windows 10 or 11 (x64) and a GPU driver with Vulkan 1.3. Unzip the apps
 | Projects | `.sabercat` project files with layers and layer transforms |
 | Integration | Owned or borrowed Vulkan device, stable C ABI with `struct_size` versioning, CMake package |
 | Applications | Viewer with orbit camera, drag and drop, and an ImGui debug panel; Studio with layers, inspector, project save / open, and export |
+| Tools | `sabercat_compare`: PSNR, FLIP and HDR-FLIP between two images (PNG, JPEG, WebP, EXR), with error maps ([docs/compare.md](docs/compare.md)). It also opens a window for comparing images (split, wipe, flicker, difference, probe, GPU PSNR/MSE, projects, exports). |
 
 ## Design highlights
 
