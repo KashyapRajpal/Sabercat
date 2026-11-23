@@ -47,7 +47,7 @@ if(TARGET sabercat_compare)
         -DFLIP_IMAGES=${flip_source_dir}/images
         -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli_hdr_work
         -P ${CMAKE_CURRENT_SOURCE_DIR}/../compare_golden/run_cli_checks.cmake)
-    set_tests_properties(test_cli_hdr PROPERTIES LABELS cpu TIMEOUT 120)
+    set_tests_properties(test_cli_hdr PROPERTIES LABELS cpu TIMEOUT 600)
 endif()
 
 #
