@@ -76,7 +76,7 @@ SystemInfoFacts sampleFacts()
 
 void testSystemInfoText(Context & ctx)
 {
-    const std::string text = app::formatSystemInfo(sampleFacts(), "C:\\logs\\viewer-1.log");
+    const std::string text = app::formatSystemInfo(sampleFacts(), "C:\\logs\\viewer-1.log"); // repo-check: allow
     UNIT_CHECK(ctx, text.rfind("Sabercat Viewer 1.0.0-beta.1 (git 1a2b3c4)\n", 0) == 0);
     UNIT_CHECK(ctx, contains(text, "Build: Release\n"));
     UNIT_CHECK(ctx, contains(text, "OS: Windows 11 (10.0 build 26200)\n"));
@@ -87,7 +87,7 @@ void testSystemInfoText(Context & ctx)
     UNIT_CHECK(ctx, contains(text, "Ray query: yes\n"));
     UNIT_CHECK(ctx, contains(text, "Float atomics: no\n"));
     UNIT_CHECK(ctx, contains(text, "Validation: off\n"));
-    UNIT_CHECK(ctx, contains(text, "Log file: C:\\logs\\viewer-1.log\n"));
+    UNIT_CHECK(ctx, contains(text, "Log file: C:\\logs\\viewer-1.log\n")); // repo-check: allow
 
     // No device and logging off: the GPU lines are replaced, the log says off.
     SystemInfoFacts noDevice = sampleFacts();

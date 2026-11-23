@@ -33,13 +33,13 @@ using app::AssociationState;
 
 // Paths with a space and a non-ASCII folder name, the cases the quoting must
 // survive. The non-ASCII character is written as a UTF-16 escape.
-const std::wstring kThisExe = L"C:\\Program Files\\Sabercat \u00DC\\bin\\sabercat_studio.exe";
-const std::wstring kOtherExe = L"D:\\Tools\\sabercat_studio.exe";
+const std::wstring kThisExe = L"C:\\Program Files\\Sabercat \u00DC\\bin\\sabercat_studio.exe"; // repo-check: allow
+const std::wstring kOtherExe = L"D:\\Tools\\sabercat_studio.exe"; // repo-check: allow
 
 void testOpenCommand(Context & ctx)
 {
-    UNIT_CHECK(ctx, app::buildOpenCommand(L"C:\\Apps\\sabercat_studio.exe")
-                        == L"\"C:\\Apps\\sabercat_studio.exe\" \"%1\"");
+    UNIT_CHECK(ctx, app::buildOpenCommand(L"C:\\Apps\\sabercat_studio.exe") // repo-check: allow
+                        == L"\"C:\\Apps\\sabercat_studio.exe\" \"%1\""); // repo-check: allow
     // Spaces and non-ASCII stay inside the quotes, so the shell passes one argument.
     UNIT_CHECK(ctx, app::buildOpenCommand(kThisExe) == L"\"" + kThisExe + L"\" \"%1\"");
 }
@@ -47,8 +47,8 @@ void testOpenCommand(Context & ctx)
 void testIconValue(Context & ctx)
 {
     // The negative index names the resource ID, not the position of the icon.
-    UNIT_CHECK(ctx, app::buildDefaultIconValue(L"C:\\Apps\\sabercat_studio.exe", 101)
-                        == L"\"C:\\Apps\\sabercat_studio.exe\",-101");
+    UNIT_CHECK(ctx, app::buildDefaultIconValue(L"C:\\Apps\\sabercat_studio.exe", 101) // repo-check: allow
+                        == L"\"C:\\Apps\\sabercat_studio.exe\",-101"); // repo-check: allow
     UNIT_CHECK(ctx, app::buildDefaultIconValue(kThisExe, IDI_SABERCAT) == L"\"" + kThisExe + L"\",-101");
 }
 
@@ -57,8 +57,8 @@ void testCommandParsing(Context & ctx)
     // What the command was built from comes back out, spaces and non-ASCII included.
     UNIT_CHECK(ctx, app::exePathFromOpenCommand(app::buildOpenCommand(kThisExe)) == kThisExe);
     // An unquoted command: the first word.
-    UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"C:\\Apps\\studio.exe \"%1\"") == L"C:\\Apps\\studio.exe");
-    UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"  \"C:\\a b\\s.exe\" \"%1\"") == L"C:\\a b\\s.exe");
+    UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"C:\\Apps\\studio.exe \"%1\"") == L"C:\\Apps\\studio.exe"); // repo-check: allow
+    UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"  \"C:\\a b\\s.exe\" \"%1\"") == L"C:\\a b\\s.exe"); // repo-check: allow
     UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"") == L"");
     UNIT_CHECK(ctx, app::exePathFromOpenCommand(L"   ") == L"");
 }

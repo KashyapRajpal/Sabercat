@@ -1,0 +1,188 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from NVlabs FLIP, BSD-3-Clause
+
+// Shared by the five LDR-FLIP kernels (flip_*.slang). The math is a port of FLIP.h
+// (LDR_FLIP, computeColorDifference, computeFeatureDifferenceAndFinalError and the
+// color helpers of color3), in the same operation order, so the GPU map matches the
+// CPU flip() of flip_metric.cpp up to float rounding.
+//
+// The host (flip_gpu.cpp) builds the kernel[] table from flipKernels(ppd); the layout
+// is documented there. Every FLIP tunable comes from kernel[]. Only the CIE constants
+// (delta = 6/29 and so on) are written here.
+
+#ifndef SABERCAT_FLIP_COMMON_SLANGH
+#define SABERCAT_FLIP_COMMON_SLANGH
+
+// Push constants, mirrored by FlipGpuParams in flip_gpu.cpp (80 bytes). The HDR fields are
+// read only by the HDR kernels; the LDR kernels ignore them.
+struct FlipParams
+{
+    int aOffsetX;
+    int aOffsetY;
+    int bOffsetX;
+    int bOffsetY;
+    int overlapX;
+    int overlapY;
+    uint width;
+    uint height;
+    uint aWidth;
+    uint bWidth;
+    uint aLinear;
+    uint bLinear;
+    uint spatialRadius;
+    uint featureRadius;
+    uint featureBase;
+    uint hdrFlags;          // bit 0: count non-finite samples; bit 1: first exposure (accumulate)
+    float exposureScale;    // 2^exposure of the current HDR exposure
+    float exposureFraction; // i / (count - 1) of the current HDR exposure
+    uint toneMapper;        // FLIP's index: 0 Reinhard, 1 ACES, 2 Hable
+    uint hdrPad;
+};
+
+[vk::push_constant] ConstantBuffer<FlipParams> params;
+
+// Binding 0 is the kernel table in every FLIP shader.
+[vk::binding(0, 0)] StructuredBuffer<float4> kernel;
+
+// Clamp to [0,1] with the same comparisons as FLIP's Min(Max(v, 0), 1). NaN gives 0.
+float clampUnit(float v)
+{
+    return (v > 0.0f) ? ((v > 1.0f) ? 1.0f : v) : 0.0f;
+}
+
+float3 clampUnit3(float3 v)
+{
+    return float3(clampUnit(v.x), clampUnit(v.y), clampUnit(v.z));
+}
+
+// sRGB transfer function of FLIP's color3::LinearRGBTosRGB, for c in [0,1].
+float srgbTransfer(float c)
+{
+    return (c <= 0.0031308f) ? 12.92f * c : 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// Linear sRGB to XYZ (D65): kernel[2..4] hold the rows of the matrix.
+float3 linearRgbToXyz(float3 rgb)
+{
+    const float4 r0 = kernel[2];
+    const float4 r1 = kernel[3];
+    const float4 r2 = kernel[4];
+    return float3(r0.x * rgb.x + r0.y * rgb.y + r0.z * rgb.z,
+                  r1.x * rgb.x + r1.y * rgb.y + r1.z * rgb.z,
+                  r2.x * rgb.x + r2.y * rgb.y + r2.z * rgb.z);
+}
+
+// XYZ to linear sRGB (D65): kernel[5..7] hold the rows of the matrix.
+float3 xyzToLinearRgb(float3 xyz)
+{
+    const float4 r0 = kernel[5];
+    const float4 r1 = kernel[6];
+    const float4 r2 = kernel[7];
+    return float3(r0.x * xyz.x + r0.y * xyz.y + r0.z * xyz.z,
+                  r1.x * xyz.x + r1.y * xyz.y + r1.z * xyz.z,
+                  r2.x * xyz.x + r2.y * xyz.y + r2.z * xyz.z);
+}
+
+// XYZ to YCxCz, FLIP's color3::XYZToYCxCz with the default illuminant
+// (kernel[9] = 1 / reference illuminant, applied component-wise first).
+float3 xyzToYCxCz(float3 xyz)
+{
+    const float3 v = xyz * kernel[9].xyz;
+    const float y = 116.0f * v.y - 16.0f;
+    const float cx = 500.0f * (v.x - v.y);
+    const float cz = 200.0f * (v.y - v.z);
+    return float3(y, cx, cz);
+}
+
+// YCxCz to XYZ, FLIP's color3::YCxCzToXYZ with the default illuminant
+// (kernel[8] = reference illuminant, applied component-wise last).
+float3 yCxCzToXyz(float3 ycc)
+{
+    const float y = (ycc.x + 16.0f) / 116.0f;
+    const float cx = ycc.y / 500.0f;
+    const float cz = ycc.z / 200.0f;
+    const float x = y + cx;
+    const float z = y - cz;
+    return float3(x, y, z) * kernel[8].xyz;
+}
+
+// XYZ to CIE L*a*b*, FLIP's color3::XYZToCIELab with the default illuminant.
+float3 xyzToLab(float3 xyz)
+{
+    const float delta = 6.0f / 29.0f;
+    const float deltaSquare = delta * delta;
+    const float deltaCube = delta * deltaSquare;
+    const float factor = 1.0f / (3.0f * deltaSquare);
+    const float term = 4.0f / 29.0f;
+
+    float3 v = xyz * kernel[9].xyz;
+    v.x = (v.x > deltaCube) ? pow(v.x, 1.0f / 3.0f) : factor * v.x + term;
+    v.y = (v.y > deltaCube) ? pow(v.y, 1.0f / 3.0f) : factor * v.y + term;
+    v.z = (v.z > deltaCube) ? pow(v.z, 1.0f / 3.0f) : factor * v.z + term;
+    const float l = 116.0f * v.y - 16.0f;
+    const float a = 500.0f * (v.x - v.y);
+    const float b = 200.0f * (v.y - v.z);
+    return float3(l, a, b);
+}
+
+// FLIP's color3::Hunt: 0.01 * luminance * chrominance. kernel[1].y is Hunt(1, 1) = 0.01.
+float hunt(float luminance, float chrominance)
+{
+    return kernel[1].y * luminance * chrominance;
+}
+
+// FLIP's color3::HyAB: city-block distance in L plus Euclidean distance in ab.
+float hyab(float3 ref, float3 test)
+{
+    const float cityBlockDistanceL = abs(ref.x - test.x);
+    const float euclideanDistanceAB = sqrt((ref.y - test.y) * (ref.y - test.y)
+                                           + (ref.z - test.z) * (ref.z - test.z));
+    return cityBlockDistanceL + euclideanDistanceAB;
+}
+
+// Re-maps a value d = HyAB^gqc to [0,1] as computeColorDifference does: below pccmax
+// it is scaled into [0, gpt]; above, it is mapped linearly into (gpt, 1].
+// kernel[0] = (cmax, pccmax, gpt, gqc).
+float colorRemap(float d)
+{
+    const float cmax = kernel[0].x;
+    const float pccmax = kernel[0].y;
+    const float gpt = kernel[0].z;
+    if (d < pccmax)
+    {
+        return d * (gpt / pccmax);
+    }
+    return gpt + ((d - pccmax) / (cmax - pccmax)) * (1.0f - gpt);
+}
+
+// Edge clamp of FLIP's Min(Max(0, v), n - 1) for a filter tap index.
+int clampEdge(int v, int n)
+{
+    return (v < 0) ? 0 : ((v > n - 1) ? n - 1 : v);
+}
+
+// FLIP's color3::linearRGBToLuminance.
+float linearRgbToLuminance(float3 c)
+{
+    return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
+
+// FLIP's image::toneMap for one linear RGB color. tm is FLIP's index (0 Reinhard, 1 ACES,
+// 2 Hable). The rational coefficients of tm 1 and 2 are kernel entries written by the host:
+// toneBase = featureBase + 2 * featureRadius + 1, numerator kernel[toneBase + 2 * tm] and
+// denominator kernel[toneBase + 2 * tm + 1], each (c0, c1, c2, 0).
+float3 toneMap(float3 c, uint tm)
+{
+    if (tm == 0u)
+    {
+        const float factor = 1.0f / (1.0f + linearRgbToLuminance(c));
+        return c * factor;
+    }
+    const uint toneBase = params.featureBase + 2u * params.featureRadius + 1u;
+    const float4 n = kernel[toneBase + 2u * tm];
+    const float4 d = kernel[toneBase + 2u * tm + 1u];
+    return ((c * c) * n.x + c * n.y + n.z) / ((c * c) * d.x + c * d.y + d.z);
+}
+
+#endif // SABERCAT_FLIP_COMMON_SLANGH

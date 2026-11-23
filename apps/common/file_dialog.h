@@ -45,6 +45,7 @@ std::vector<FileFilter> sceneFileFilters();
 std::vector<FileFilter> projectFileFilters();
 std::vector<FileFilter> plyFileFilters();
 std::vector<FileFilter> glbFileFilters();
+std::vector<FileFilter> spzFileFilters();
 
 // Converts each FileFilter into the wide strings COMDLG_FILTERSPEC points at.
 std::vector<FilterSpec> buildFilterSpecs(const std::vector<FileFilter> & filters);

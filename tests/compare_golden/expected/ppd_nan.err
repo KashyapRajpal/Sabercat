@@ -1,0 +1,14 @@
+error: --ppd must be a number from 1 to 1000, got 'nan'
+usage: sabercat_compare <reference.png> <test.png> [--flip-map out.png] [--diff-map out.png]
+                        [--ppd N] [--no-flip] [--hdr] [--tone-mapper aces|hable|reinhard]
+                        [--start-exposure X] [--stop-exposure Y] [--num-exposures N]
+                        [--exposure-map out.png] [--report out.json|out.csv] [--help]
+  --ppd N   FLIP pixels per degree, from 1 to 1000 (default about 67)
+  --hdr     HDR-FLIP on linear inputs (EXR); the values may exceed 1
+  --tone-mapper aces|hable|reinhard   tone mapper for --hdr (default aces)
+  --start-exposure X   first exposure in stops, for --hdr
+  --stop-exposure Y    last exposure in stops, for --hdr
+  --num-exposures N    exposures from 2 to 1000, for --hdr
+  --exposure-map out.png   HDR exposure map, for --hdr
+  --report out.json|out.csv   comparison report (CSV for a .csv name)
+  inputs may be .png, .jpg, .jpeg, .webp, .exr or .rgba32f; no arguments opens the GUI

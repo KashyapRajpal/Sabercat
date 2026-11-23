@@ -4,7 +4,7 @@
 // Sabercat Studio -- the editing application (docs/studio-design.md). S1 is the
 // shell: it owns the Vulkan instance and device (ownership model B, docs/library.md)
 // and lends them to the renderer; it edits a project's layers, saves and opens
-// .sabercat projects, and exports PLY and glTF.
+// .sabercat projects, and exports PLY, glTF and SPZ.
 //
 //   sabercat_studio.exe [project.sabercat | scene files...]
 //   sabercat_studio.exe --selftest <outDir> <scene>...     (headless, no window)

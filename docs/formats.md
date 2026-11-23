@@ -5,7 +5,7 @@ This document describes every file format Sabercat reads or writes:
 - the scene inputs that `loadScene()` accepts,
 - the cloud-v1 directory (`sabercat.cloud-v1`) and its relight sidecar (`sabercat.relight-v1`),
 - the project file (`.sabercat`),
-- the PLY and glTF exports.
+- the PLY, glTF and SPZ exports.
 
 Use it to check what a file must contain, what a loader does to it, and what a writer produces.
 
@@ -18,7 +18,7 @@ Use it to check what a file must contain, what a loader does to it, and what a w
 | --- | --- | --- | --- |
 | `.ply` (3DGS, and SuperSplat compressed) | read, write (3DGS only) | `ply` magic and extension | [PLY](#ply) |
 | `.splat` | read | extension only (headerless) | [.splat](#splat) |
-| `.spz` | read | extension and container | [.spz](#spz) |
+| `.spz` | read, write | extension and container | [.spz](#spz), [SPZ export](#spz-export) |
 | `.ksplat` | read | extension | [.ksplat](#ksplat) |
 | `.sog` or `meta.json` | read | extension or file name | [.sog](#sog) |
 | `.gltf`, `.glb` (`KHR_gaussian_splatting`) | read, write (`.glb`) | extension and binary magic | [glTF](#gltf-export) |
@@ -334,7 +334,7 @@ layers/<id>/relight/         the layer's relight sidecar, if the cloud has relig
 
 The archive uses stored (uncompressed) entries. The reader also accepts deflated entries.
 
-Zip64 is not supported, in either direction. The reader rejects an archive with zip64 markers or more entries than a standard zip holds.
+Zip64 is read and written. The writer uses it only when a classic zip cannot hold the project: an entry or the archive is over 4 GiB, or there are more than 65,534 entries.
 
 Entries the format does not name are skipped with a warning. This lets a newer writer add entries without breaking this reader.
 
@@ -477,6 +477,32 @@ Studio exports the visible layers. The layer transforms are applied by the expor
 
 - **PLY** merges the visible layers into one cloud with `mergeLayers` and writes it with `PLYWriter`. The SH degree of the merged cloud is the highest degree of the inputs. A relight stream is kept only when every visible layer has it. A stream that only some layers have is dropped with a warning.
 - **glTF** writes one node per visible layer with `GLTFWriter`. Relight data is not exported.
+- **SPZ** merges the visible layers with `mergeLayers` and writes the result with `SPZWriter` at the default version. Relight data is not exported.
+
+---
+
+## SPZ export
+
+`SPZWriter::write` writes a `.spz` file that `SpzReader` reads back. The default container is version 3 (gzip). Version 4 (zstd, NGSP) is also accepted. Apart from the quantization below, the writer is the exact inverse of the reader.
+
+Each value is quantized to a fixed width. The table gives the range the writer accepts.
+
+| Field | Stored as | Range and policy |
+| --- | --- | --- |
+| position | 24-bit fixed point, 12 fractional bits | About +-2048. Outside that range the write is refused. The step is 1/4096. |
+| scale | 1 byte, log scale | `ln s` in [-10, 5.94]. Outside that range it is clamped. |
+| rotation | 4 bytes, smallest-three | Normalized before encoding. A zero quaternion becomes the identity. |
+| opacity | 1 byte, sigmoid | Outside the representable range it is clamped. |
+| DC color | 1 byte | About +-3.33. Beyond that it saturates (clamped). |
+| SH | 1 byte per coefficient: 5 bits for degree 1, 4 bits for degrees 2 and 3 | [-1, 127/128]. Beyond that it saturates (clamped). |
+
+- A position outside the range is refused, not clamped. A clamp would move the Gaussian.
+- A non-finite position, scale, rotation, opacity or SH value is refused. The error names the Gaussian.
+- Out-of-range scale, opacity, DC color and SH values are clamped. The writer logs one warning per write, not one per value.
+- An empty cloud is refused. So is a cloud with more than `SPZWriter::kMaxGaussians` (`INT32_MAX / 72`, about 29.8 million) Gaussians.
+- SH degree above 3 is refused. The degree is written from the cloud's `shDegree()`.
+- The antialiased flag is written. Relight streams, time data and layer transforms are not.
+- The host vectors must be populated. Call `downloadFromGPU()` first if the host copy was dropped.
 
 ---
 
@@ -498,5 +524,4 @@ Studio exports the visible layers. The layer transforms are applied by the expor
 - `.ksplat` files with SH degree 3 are not supported.
 - SOG `meta.json` version 1 and streamed SOG (`lod-meta.json`) are not supported.
 - glTF compression extensions other than `KHR_gaussian_splatting_compression_spz_2` are not supported.
-- Zip64 archives are not supported for projects.
 - The glTF export has no relight data, and the cloud-v1 format has no antialiasing flag. The project file stores that flag.

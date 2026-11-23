@@ -98,6 +98,13 @@ enum class DebugView
     SHDegree,
 };
 
+// Display scales for the debug views. The defaults are the ones present() uses.
+struct DebugViewScales
+{
+    float depth = 50.0f;   // Depth view: front depth / depth -> [0,1] grayscale
+    float density = 64.0f; // TileDensity view: instances per tile / density -> [0,1] heat
+};
+
 // Frames-in-flight count (PERFORMANCE.md design rule 3): command buffers,
 // per-frame descriptor sets, acquire semaphores and fences are duplicated this many
 // times so the CPU can record frame N+1 while the GPU still works on frame
@@ -403,6 +410,26 @@ class Renderer
     // only on a resize; contents are valid from forward() returning until
     // the next forward(). Same throw rules as readDepth().
     BufferView depthView() const;
+
+    // Runs `view` over the last forward() (either RenderMode) into a headless
+    // image and returns it as a device buffer of width*height RGBA floats,
+    // row-major (stride 16, offset 0), display-referred: exactly what
+    // present() shows for that view with the same scales. DebugView::Final
+    // is the forward color image (the readImage() values, bit for bit) -- not
+    // the lit image. Does not re-run forward() and writes nothing forward()
+    // or backward() read, so it may be called any number of times, and after
+    // present(). Throws before any forward(), after the scene changed since
+    // the last forward() (loadScene, setGaussians, ..., clearScene) or a
+    // resize, and if the last forward() did not complete; also if the
+    // renderer was initialized without a shader directory, or a scale is not
+    // positive. The buffer is allocated on the first call (nothing is paid by
+    // an app that never calls this). One buffer is reused: its handle is
+    // stable across calls and changes only on a resize, and its contents are
+    // valid until the next renderDebugView()/readDebugView() or resize.
+    // Validity rules: see docs/library.md.
+    BufferView renderDebugView(DebugView view, const DebugViewScales & scales = {});
+    // Host copy of renderDebugView(): width*height RGBA floats, row-major.
+    std::vector<float> readDebugView(DebugView view, const DebugViewScales & scales = {});
 
     // --- Relighting ---
     //

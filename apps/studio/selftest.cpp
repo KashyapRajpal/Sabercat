@@ -14,6 +14,8 @@
 #include "sabercat/project.h"
 #include "sabercat/renderer.h"
 #include "sabercat/scene_loader.h"
+#include "sabercat/spz_reader.h"
+#include "sabercat/spz_writer.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -475,19 +477,24 @@ void runChecks(Renderer & renderer, const std::string & outDir, const std::vecto
             "relight settings not restored");
     std::cout << "project round trip: bit-exact, " << loaded.layers.size() << " layers" << std::endl;
 
-    // 4. Export PLY and GLB from the reopened project.
+    // 4. Export PLY, GLB and SPZ from the reopened project.
     const std::string plyPath = outDir + "/selftest.ply";
     const std::string glbPath = outDir + "/selftest.glb";
+    const std::string spzPath = outDir + "/selftest.spz";
     start = Clock::now();
     exportPly(reopened, device, plyPath);
     const double plySeconds = secondsSince(start);
     start = Clock::now();
     exportGlb(reopened, glbPath);
     const double glbSeconds = secondsSince(start);
+    start = Clock::now();
+    exportSpz(reopened, device, spzPath);
+    const double spzSeconds = secondsSince(start);
     std::cout << "export PLY: " << plySeconds << " s, " << fileBytes(plyPath) << " bytes" << std::endl;
     std::cout << "export GLB: " << glbSeconds << " s, " << fileBytes(glbPath) << " bytes" << std::endl;
+    std::cout << "export SPZ: " << spzSeconds << " s, " << fileBytes(spzPath) << " bytes" << std::endl;
 
-    // 5. Reload both exports. The reference is mergeLayers of the same layers.
+    // 5. Reload the exports. The reference is mergeLayers of the same layers.
     const auto visible = visibleLayers(reopened);
     const std::shared_ptr<GaussianCloud> merged = mergeLayers(device, visible);
     require(merged->count() > 0, "merged scene is empty");
@@ -513,6 +520,17 @@ void runChecks(Renderer & renderer, const std::string & outDir, const std::vecto
                                      + " in " + worst.stream);
     std::cout << "GLB reload vs mergeLayers: worst error " << worst.value << " (" << worst.stream
               << "), " << merged->count() << " Gaussians" << std::endl;
+
+    // SPZ stores positions as 24-bit fixed point with 12 fractional bits, so the
+    // rounding error is at most 1/8192 (about 1.22e-4); the bound is 1.3e-4.
+    const std::shared_ptr<GaussianCloud> fromSpz = SpzReader::read(device, spzPath);
+    require(fromSpz->count() == merged->count(), "SPZ count " + std::to_string(fromSpz->count())
+                                                     + " != merged " + std::to_string(merged->count()));
+    const double spzPositionError = worstError(fromSpz->positions(), merged->positions(), 3);
+    require(spzPositionError <= 1.3e-4, "SPZ positions differ from mergeLayers by "
+                                            + std::to_string(spzPositionError));
+    std::cout << "SPZ reload vs mergeLayers: worst position error " << spzPositionError << ", "
+              << merged->count() << " Gaussians" << std::endl;
 
     // 6. One forward frame of the merged scene through the app's rebuild path.
     rebuildScene(reopened, renderer);
@@ -560,6 +578,7 @@ void runChecks(Renderer & renderer, const std::string & outDir, const std::vecto
     require(!hasImage, "hidden project still produces an image");
     fs::remove(fs::u8path(outDir + "/unused.glb"));
     fs::remove(fs::u8path(outDir + "/unused.ply"));
+    fs::remove(fs::u8path(outDir + "/unused.spz"));
     bool refused = false;
     try
     {
@@ -580,9 +599,20 @@ void runChecks(Renderer & renderer, const std::string & outDir, const std::vecto
         plyRefused = true;
     }
     require(plyRefused, "PLY export with no visible layers was not refused");
-    require(!fs::exists(fs::u8path(outDir + "/unused.ply")) && !fs::exists(fs::u8path(outDir + "/unused.glb")),
+    bool spzRefused = false;
+    try
+    {
+        exportSpz(reopened, device, outDir + "/unused.spz");
+    }
+    catch (const std::runtime_error &)
+    {
+        spzRefused = true;
+    }
+    require(spzRefused, "SPZ export with no visible layers was not refused");
+    require(!fs::exists(fs::u8path(outDir + "/unused.ply")) && !fs::exists(fs::u8path(outDir + "/unused.glb"))
+                && !fs::exists(fs::u8path(outDir + "/unused.spz")),
             "a refused export left a file behind");
-    std::cout << "no visible layers: nothing rendered, PLY and GLB export refused" << std::endl;
+    std::cout << "no visible layers: nothing rendered, PLY, GLB and SPZ export refused" << std::endl;
 }
 
 } // namespace

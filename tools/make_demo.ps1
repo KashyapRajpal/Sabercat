@@ -91,7 +91,7 @@ $exeFull = Get-FullPath $Exe (Get-Location).Path
 $script:ffmpegExe = Find-Ffmpeg $Ffmpeg
 Write-Host "ffmpeg: $script:ffmpegExe"
 
-$fontPath = 'C:/Windows/Fonts/segoeui.ttf'
+$fontPath = 'C:/Windows/Fonts/segoeui.ttf' # repo-check: allow
 if (-not (Test-Path -LiteralPath $fontPath -PathType Leaf)) {
     throw "Caption font not found: $fontPath"
 }

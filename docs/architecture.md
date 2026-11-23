@@ -62,7 +62,7 @@ noted.
 | Compute plumbing | `shader_compiler.h`, `descriptor_set.h`, `pipeline.h`, `command_buffer.h` | `shader_compiler.cpp`, `descriptor_set.cpp`, `pipeline.cpp`, `command_buffer.cpp` |
 | Gaussian data | `gaussian_cloud.h`, `buffer_view.h`, `borrowed.h`, `scene_bounds.h`, `render_config.h` | `gaussian_cloud.cpp`, `borrowed.cpp` |
 | Loaders | `scene_loader.h`, `ply_reader.h`, `splat_reader.h`, `spz_reader.h`, `gltf_reader.h`, `ksplat_reader.h`, `sog_reader.h`, `cloud_v1_reader.h` | matching `.cpp` files |
-| Writers and projects | `ply_writer.h`, `gltf_writer.h`, `cloud_v1_writer.h`, `project.h`, `file_map.h`, `layer_transform.h` | matching `.cpp`, `zip_archive.{h,cpp}` (internal), `sh_rotation.{h,cpp}` (internal) |
+| Writers and projects | `ply_writer.h`, `gltf_writer.h`, `spz_writer.h`, `cloud_v1_writer.h`, `project.h`, `file_map.h`, `layer_transform.h` | matching `.cpp`, `zip_archive.{h,cpp}` (internal), `sh_rotation.{h,cpp}` (internal) |
 | Forward and backward | `forward_pass.h`, `backward_pass.h`, `debug_visualizer.h`, `camera.h` | `forward_pass.cpp`, `backward_pass.cpp`, `debug_visualizer.cpp` |
 | Lighting, shadows, bake | `lighting.h`, `relight_pass.h`, `shadow_pass.h`, `visibility_pass.h`, `gaussian_acceleration_structure.h` | `lighting.cpp`, `relight_pass.cpp`, `shadow_pass.cpp`, `visibility_pass.cpp`, `gaussian_acceleration_structure.cpp` |
 | Facade and C ABI | `renderer.h`, `c_api.h` | `renderer.cpp`, `src/api/c_api.cpp` |
@@ -1093,7 +1093,7 @@ produces.
 ## 16. Studio
 
 Studio (`apps/studio`, target `sabercat_studio`) edits layers and saves
-projects. It exports PLY and GLB.
+projects. It exports PLY, GLB and SPZ.
 
 Studio is always an owner of its device (model B). It creates the instance and
 device through `BorrowedVulkanHost` (`apps/common`) and calls
@@ -1111,6 +1111,7 @@ B with `--borrowed`.
 | `zip::` (internal) | `src/renderer/zip_archive.{h,cpp}` | STORED writer. Reads STORED and DEFLATE entries and checks CRC. Not installed |
 | `PLYWriter` | `ply_writer.h` | Exact inverse of `PLYReader`. Writes R3DG attributes when relight streams exist |
 | `GLTFWriter` | `gltf_writer.h` | `KHR_gaussian_splatting` as one `.glb`, one mesh and one node per layer |
+| `SPZWriter` | `spz_writer.h` | Exact inverse of `SpzReader`. Quantized `.spz`, container version 3 by default |
 | `LayerTransform`, `transformedCopy`, `mergeLayers` | `layer_transform.h` | Rigid placement with uniform scale, and a host-side merge of the visible layers |
 | `sh_rotation` (internal) | `src/renderer/sh_rotation.{h,cpp}` | Rotates SH bands 1-3 for a layer rotation |
 | `apps/common` | `apps/common/` | Shared app code: window and ImGui, borrowed host, orbit camera, relight panel, asset scan, about panel |
@@ -1194,8 +1195,8 @@ Release, cluster "fly" XXL, 3,506,799 Gaussians, one layer:
 - When every layer is hidden the viewport is empty (Studio calls
   `Renderer::clearScene()`).
 - Loading reads the whole archive into memory.
-- No zip64. An archive over 4 GiB or with more than 65534 entries is refused
-  with an error.
+- The project file is written as Zip64 when it exceeds the classic limits
+  (an entry or the archive over 4 GiB, or more than 65534 entries).
 - The apps use the native Windows file dialogs, with a typed path as the
   fallback when a dialog cannot be shown.
 - Layer merge runs on the host.
