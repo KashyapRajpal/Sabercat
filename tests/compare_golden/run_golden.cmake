@@ -5,10 +5,14 @@
 # fixtures and records stdout, stderr, the exit code and any map PNG it writes.
 # MODE=capture stores those in EXPECTED from a known-good exe. MODE=check
 # compares them byte-for-byte and fails, naming the case and file, on any
-# difference. A missing expected file is a failure.
+# difference. A missing expected file is a failure. A PNG passes only when the
+# bytes match and the decoded pixels match: PIXEL_TOOL (sabercat_compare_png_pixels)
+# compares the pixels, and its result is printed for each PNG.
+# On CI (environment variable GITHUB_ACTIONS is "true") a PNG whose bytes differ but whose
+# decoded pixels are identical is accepted with a note. Locally that case still fails.
 #
 #   cmake -DEXE=<exe> -DFIXTURES=<dir> -DFLIP_IMAGES=<dir> -DEXPECTED=<dir>
-#         -DWORK=<dir> -DMODE=check|capture -P run_golden.cmake
+#         -DWORK=<dir> -DPIXEL_TOOL=<exe> -DMODE=check|capture -P run_golden.cmake
 
 foreach(var EXE FIXTURES FLIP_IMAGES EXPECTED WORK MODE)
     if(NOT DEFINED ${var} OR "${${var}}" STREQUAL "")
@@ -17,6 +21,11 @@ foreach(var EXE FIXTURES FLIP_IMAGES EXPECTED WORK MODE)
 endforeach()
 if(NOT MODE STREQUAL "check" AND NOT MODE STREQUAL "capture")
     message(FATAL_ERROR "run_golden.cmake: MODE must be check or capture, got '${MODE}'")
+endif()
+if(MODE STREQUAL "check")
+    if(NOT DEFINED PIXEL_TOOL OR "${PIXEL_TOOL}" STREQUAL "" OR NOT EXISTS "${PIXEL_TOOL}")
+        message(FATAL_ERROR "run_golden.cmake: the pixel comparison tool is missing: ${PIXEL_TOOL} (build the sabercat_compare_png_pixels target)")
+    endif()
 endif()
 
 # One case per line, as "name|arguments". Arguments are split on spaces, and
@@ -94,7 +103,42 @@ macro(golden_record source_file expected_file leaf)
                 OUTPUT_QUIET
                 ERROR_QUIET
             )
-            if(NOT golden_differs EQUAL 0)
+            if("${leaf}" MATCHES "\\.png$")
+                # The decoded pixels are compared too. The status line is printed for
+                # every PNG, whether it passes or fails.
+                execute_process(
+                    COMMAND "${PIXEL_TOOL}" "${source_file}" "${expected_file}"
+                    RESULT_VARIABLE pixel_status
+                    OUTPUT_VARIABLE pixel_text
+                    ERROR_VARIABLE pixel_error
+                )
+                string(STRIP "${pixel_text}" pixel_text)
+                string(STRIP "${pixel_error}" pixel_error)
+                set(pixel_line "${pixel_text}")
+                if(NOT "${pixel_error}" STREQUAL "")
+                    string(APPEND pixel_line " (stderr: ${pixel_error})")
+                endif()
+                message(STATUS "golden pixels ${leaf}: ${pixel_line} (exit ${pixel_status})")
+
+                set(bytes_differ FALSE)
+                set(pixels_differ FALSE)
+                if(NOT golden_differs EQUAL 0)
+                    set(bytes_differ TRUE)
+                endif()
+                if(NOT pixel_status EQUAL 0)
+                    set(pixels_differ TRUE)
+                endif()
+                if(pixels_differ)
+                    list(APPEND failures "${name}: ${leaf} differs from ${expected_file} (pixels differ: ${pixel_line})")
+                elseif(bytes_differ)
+                    if("$ENV{GITHUB_ACTIONS}" STREQUAL "true")
+                        message(STATUS "CI: pixels identical, PNG bytes differ, accepted: ${leaf}")
+                    else()
+                        message(STATUS "pixels identical, bytes differ: ${leaf}")
+                        list(APPEND failures "${name}: ${leaf} differs from ${expected_file} (bytes only; decoded pixels are identical)")
+                    endif()
+                endif()
+            elseif(NOT golden_differs EQUAL 0)
                 list(APPEND failures "${name}: ${leaf} differs from ${expected_file}")
             endif()
         endif()
