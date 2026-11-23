@@ -24,10 +24,21 @@
          one zip are listed and fail the check.
       3. For each shared entry, the SHA-256 of its contents, excluding
          manifest.json (it legitimately differs: build time, CI run, ci and
-         gpuTested flags, the test list).
+         gpuTested flags, the test list). A differing non-binary entry is
+         compared again after normalizing CRLF to LF. If the two are equal, it
+         is reported as "text: line endings differ only" and does not fail. Any
+         other difference fails. With -Strict there is no normalization: the
+         bytes must be identical.
+
+    For lib/cmake/Sabercat/SabercatTargets.cmake only, a difference limited to
+    the generated cmake_policy(VERSION ...) line is accepted and reported as
+    "generated cmake_policy version line differs (accepted)". That line reflects
+    the CMake version of the build machine. Any other difference in that file
+    fails. With -Strict, neither this exception nor the line-ending one applies.
 
     Entries are classed as PE (.exe, .dll), other binary (.pdb, .lib) or
-    non-binary (every other entry). A differing non-binary entry always fails.
+    non-binary (every other entry). A differing non-binary entry fails, unless
+    it is one of the accepted differences described above.
     A differing PE is compared by its import tables (dumpbin /imports, with the
     "Dump of file" and "time date stamp" lines removed) and by its FileVersionInfo
     fields (CompanyName, FileDescription, FileVersion, InternalName,
@@ -52,8 +63,9 @@
     same order as -Local. Each file name must equal the name of its -Local pair.
 
 .PARAMETER Strict
-    Require byte-identical binaries as well. Any differing binary (PE or other)
-    then fails the pair.
+    Require byte-identical contents: no line-ending normalization for text files,
+    no cmake_policy exception for SabercatTargets.cmake, and any differing binary
+    (PE or other) fails the pair.
 
 .PARAMETER ExpectTag
     When not empty, the tag in both manifest.json files must equal this value.
@@ -109,7 +121,8 @@ function Get-EntryClass {
 function Test-ManifestEntry {
     param([string]$Name)
     # manifest.json sits at the zip root or one folder down (the package folder).
-    return ($Name -eq 'manifest.json') -or ($Name -match '^[^/]+/manifest\.json$')
+    # Both '/' and '\' are accepted as the separator.
+    return ($Name -eq 'manifest.json') -or ($Name -match '^[^/\\]+[/\\]manifest\.json$')
 }
 
 function Get-EntryHash {
@@ -126,6 +139,55 @@ function Get-EntryHash {
         $stream.Dispose()
     }
     return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-EntryTextHash {
+    param($Entry)
+    # SHA-256 of the contents with every CRLF turned into LF (line endings normalized).
+    $stream = $Entry.Open()
+    try {
+        $memory = New-Object System.IO.MemoryStream
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        } finally { $memory.Dispose() }
+    } finally { $stream.Dispose() }
+    $out = New-Object 'System.Collections.Generic.List[byte]' $bytes.Length
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+        $out.Add($bytes[$i])
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($out.ToArray()) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-EntryPolicyHash {
+    param($Entry)
+    # SHA-256 of the contents with CRLF turned into LF and the generated
+    # cmake_policy(VERSION ...) line replaced by a fixed placeholder.
+    $stream = $Entry.Open()
+    try {
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        try {
+            $text = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    $text = $text.Replace("`r`n", "`n")
+    $text = [System.Text.RegularExpressions.Regex]::Replace($text, '(?m)^cmake_policy\(VERSION [^\r\n)]*\)', 'cmake_policy(VERSION <generated>)')
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text)) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Test-GeneratedCmakeEntry {
+    param([string]$Name)
+    # Only this generated file may differ in its cmake_policy(VERSION ...) line.
+    return ($Name -replace '\\','/') -match '(^|/)lib/cmake/Sabercat/SabercatTargets\.cmake$'
 }
 
 function Get-ManifestObject {
@@ -450,6 +512,8 @@ function Compare-Pair {
         # 3. Contents of shared entries.
         Write-Host '== contents =='
         $identical = 0
+        $eolOnly = @()
+        $policyOnly = @()
         $binaryDiff = @()
         $nonBinaryDiff = @()
 
@@ -459,7 +523,13 @@ function Compare-Pair {
             if ($localHash -eq $ciHash) {
                 $identical++
             } elseif ((Get-EntryClass $name) -eq 'non-binary') {
-                $nonBinaryDiff += $name
+                if ((-not $Strict) -and ((Get-EntryTextHash $localEntries[$name]) -eq (Get-EntryTextHash $ciEntries[$name]))) {
+                    $eolOnly += $name
+                } elseif ((-not $Strict) -and (Test-GeneratedCmakeEntry $name) -and ((Get-EntryPolicyHash $localEntries[$name]) -eq (Get-EntryPolicyHash $ciEntries[$name]))) {
+                    $policyOnly += $name
+                } else {
+                    $nonBinaryDiff += $name
+                }
             } else {
                 $binaryDiff += $name
             }
@@ -468,6 +538,12 @@ function Compare-Pair {
         foreach ($name in $nonBinaryDiff) {
             Write-Host "  FAIL: non-binary differences: $name"
             $failed = $true
+        }
+        foreach ($name in $eolOnly) {
+            Write-Host "  text: line endings differ only: $name"
+        }
+        foreach ($name in $policyOnly) {
+            Write-Host "  generated cmake_policy version line differs (accepted): $name"
         }
 
         $peDiffer = 0
@@ -496,6 +572,8 @@ function Compare-Pair {
         Write-Host '== summary =='
         Write-Host ('  entries compared (excluding manifest.json): {0}' -f $shared.Count)
         Write-Host ('  identical:                                  {0}' -f $identical)
+        Write-Host ('  text, line endings differ only:             {0}' -f $eolOnly.Count)
+        Write-Host ('  generated cmake_policy line, accepted:      {0}' -f $policyOnly.Count)
         Write-Host ('  differing:                                  {0} (binary {1}, non-binary {2})' -f ($binaryDiff.Count + $nonBinaryDiff.Count), $binaryDiff.Count, $nonBinaryDiff.Count)
         Write-Host ('  PE differing with {0}: {1} of {2}' -f $peLabel, $peIdentical, $peDiffer)
         Write-Host ('  only local:                                 {0}' -f $onlyLocal.Count)

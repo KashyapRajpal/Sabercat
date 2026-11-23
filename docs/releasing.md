@@ -129,13 +129,21 @@ The C API has its own version, `SABERCAT_C_API_VERSION`, in
    - Cross-checks the CI zips with the local packages from step 1, using
      `tools\compare_packages.ps1`:
      - the same file list;
-     - identical bytes for non-PE files;
+     - identical contents for non-PE files (text files compare after normalizing
+       CRLF to LF, and a difference in line endings only is reported but accepted;
+       the generated `cmake_policy(VERSION ...)` line in
+       `lib\cmake\Sabercat\SabercatTargets.cmake` may differ, because it reflects
+       the CMake version of the build machine, and that difference is accepted;
+       any other difference in that file fails);
      - for `.exe` and `.dll`, identical import tables and version info; byte
        differences alone are accepted;
      - manifest: the same version and commit, `ci=true` and `gpuTested=false`
        for CI, `ci=false` and `gpuTested=true` for local, the tag matches, and
        the tree was not dirty.
-     When running the compare script by hand, `-Strict` is also available.
+     When running the compare script by hand, `-Strict` is also available; it
+     compares bytes exactly (no line-ending normalization) and also fails on any
+     differing binary. Neither exception (line endings, `cmake_policy`) applies
+     under `-Strict`.
    - Runs the packaged self-test and the apps self-test on the CI zips (this
      needs a GPU).
 
