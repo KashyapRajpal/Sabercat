@@ -1,0 +1,184 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Helpers shared by the Studio edit kernels (layer merge first, then select,
+// transform, delete/compact and duplicate). This is the GPU port of the HOST
+// similarity bake: bakeLayer() in src/renderer/layer_transform.cpp and
+// rotateShCoefficients() in src/renderer/sh_rotation.cpp.
+//
+// The host double-precision path is the reference. These helpers run the same
+// math in fp32 with the same semantics: the same unit-length rule for rotations,
+// the same quaternion product and renormalization, the same node matrix applied
+// to means, the same SH band rotation. Any difference from the host beyond fp32
+// round-off is a bug in the kernel, not a precision choice.
+//
+// Header-only, pure fp32, no bindings. Kernels that include it prepare
+// SimilarityParams from the host's frame (see the field notes below).
+//
+// Performance note: no helper takes SimilarityParams by value (the struct is
+// 480 bytes). Helpers that need the SH band matrices take the StructuredBuffer
+// and a layer index, so the kernel reads only the elements it uses.
+
+#ifndef SABERCAT_EDIT_COMMON_SLANGH
+#define SABERCAT_EDIT_COMMON_SLANGH
+
+#include "config.slangh"
+
+// The per-layer similarity placement, one per layer merge. Every field is a
+// 16-byte multiple or a 4-byte scalar packed at the end, so the std430 layout
+// has no implicit padding: 64 + 16 + 48 + 336 + 16 = 480 bytes.
+struct SimilarityParams
+{
+    // Node matrix T * R * S, column-vector convention: a point maps to
+    // mul(matrix, float4(p, 1)). The host uploads BakeFrame::matrix (rounded to
+    // fp32, same column order as the forward pass's worldToCamera), the matrix
+    // it applies to the means, so the GPU and host agree.
+    float4x4 matrix;      // 64 B
+
+    // Unit quaternion xyzw of the frame's rotation part: the host's
+    // BakeFrame::rotationQuaternion (a[0..2] = xyz, a[3] = w).
+    float4 frameQuat;     // 16 B
+
+    // Rows of the 3x3 rotation matrix built from frameQuat (the host's
+    // BakeFrame::rotation), row r in xyz, w unused. Normals are rotated by these.
+    float4 rotRows[3];    // 48 B
+
+    // SH band rotation matrices, flattened. Band b (1..3) is the (2b+1)^2 matrix
+    // with element (row, col) at float index bandBase(b) + row * (2b+1) + col:
+    // band 1 at [0, 9), band 2 at [9, 34), band 3 at [34, 83). Float 83 is
+    // padding. These are the host's BakeFrame::shBands[b-1] values.
+    float4 bands[21];     // 336 B
+
+    float uniformScale;   // 4 B: the frame's uniform scale on linear std-devs
+    uint count;           // 4 B: Gaussians this placement covers
+    uint shDegree;        // 4 B: source SH degree, 0..3
+    uint identity;        // 4 B: 1 = straight copy, no transform
+};
+
+// Applies the node matrix to a point, as the host does in double. The w = 1
+// component makes the translation part of the transform.
+float3 eTransformPoint(float4x4 m, float3 p)
+{
+    return mul(m, float4(p, 1.0f)).xyz;
+}
+
+// Composes the frame rotation with a Gaussian's rotation, as bakeLayer() does:
+//   1. renormalize q only when it is off unit length by more than 1e-6
+//      (the reader's rule, layer_transform.cpp's kUnitQuaternionTolerance);
+//   2. the product frameQuat * q, with the component formulas bakeLayer uses
+//      (a = frameQuat, b = q, both xyzw);
+//   3. renormalize the product and return xyzw.
+float4 eComposeRotation(float4 frameQuat, float4 q)
+{
+    const float lengthSquared = dot(q, q);
+    if (abs(lengthSquared - 1.0f) > 1e-6f)
+    {
+        q *= 1.0f / sqrt(lengthSquared);
+    }
+
+    const float ax = frameQuat.x, ay = frameQuat.y, az = frameQuat.z, aw = frameQuat.w;
+    const float bx = q.x, by = q.y, bz = q.z, bw = q.w;
+    const float4 r = float4(aw * bx + ax * bw + ay * bz - az * by,
+                            aw * by - ax * bz + ay * bw + az * bx,
+                            aw * bz + ax * by - ay * bx + az * bw,
+                            aw * bw - ax * bx - ay * by - az * bz);
+    return r * (1.0f / sqrt(dot(r, r)));
+}
+
+// Rotates a normal by the frame rotation: each row of the rotation dotted with
+// n, as bakeLayer() does (pass SimilarityParams::rotRows[0..2].xyz).
+float3 eRotateNormal(float3 rotRow0, float3 rotRow1, float3 rotRow2, float3 n)
+{
+    return float3(dot(rotRow0, n), dot(rotRow1, n), dot(rotRow2, n));
+}
+
+// Rotates SH bands 1..degree of one Gaussian in place, as
+// rotateShCoefficients() does. c is the canonical 16-entry band-ascending layout:
+// DC at index 0 (left untouched), band l at indices [l^2, (l+1)^2). For each band,
+//   rotated[row] = sum over col of band[row][col] * c[offset + col],
+// where offset starts at 1 and advances by 2l+1 per band. The sum for each row
+// runs over col ascending, starting from float3(0).
+//
+// buf[layer] is the placement (its bands[] are read directly, no copy). The
+// caller zero-fills c above the source degree before calling, and the output is
+// zero above it too: only bands 1..degree are touched. A degree above 3 acts as
+// 3, since the canonical layout holds 16 coefficients.
+//
+// Each band is its own block with constant trip counts, constant band base
+// offsets (0, 9, 34) and constant coefficient offsets (1, 4, 9), so after
+// unrolling every index into c, rotated and the band matrix is a compile-time
+// constant.
+void eRotateShBands(StructuredBuffer<SimilarityParams> buf, uint layer, uint degree,
+                    inout float3 c[SABERCAT_SH_COEFFS])
+{
+    // Band 1: 3x3 matrix at float base 0, coefficients [1, 4).
+    if (degree >= 1)
+    {
+        float3 rotated[3];
+        [ForceUnroll]
+        for (uint row = 0; row < 3; ++row)
+        {
+            float3 sum = float3(0.0f);
+            [ForceUnroll]
+            for (uint col = 0; col < 3; ++col)
+            {
+                const uint idx = 0 + row * 3 + col;
+                sum += buf[layer].bands[idx >> 2][idx & 3] * c[1 + col];
+            }
+            rotated[row] = sum;
+        }
+        [ForceUnroll]
+        for (uint row = 0; row < 3; ++row)
+        {
+            c[1 + row] = rotated[row];
+        }
+    }
+
+    // Band 2: 5x5 matrix at float base 9, coefficients [4, 9).
+    if (degree >= 2)
+    {
+        float3 rotated[5];
+        [ForceUnroll]
+        for (uint row = 0; row < 5; ++row)
+        {
+            float3 sum = float3(0.0f);
+            [ForceUnroll]
+            for (uint col = 0; col < 5; ++col)
+            {
+                const uint idx = 9 + row * 5 + col;
+                sum += buf[layer].bands[idx >> 2][idx & 3] * c[4 + col];
+            }
+            rotated[row] = sum;
+        }
+        [ForceUnroll]
+        for (uint row = 0; row < 5; ++row)
+        {
+            c[4 + row] = rotated[row];
+        }
+    }
+
+    // Band 3: 7x7 matrix at float base 34, coefficients [9, 16).
+    if (degree >= 3)
+    {
+        float3 rotated[7];
+        [ForceUnroll]
+        for (uint row = 0; row < 7; ++row)
+        {
+            float3 sum = float3(0.0f);
+            [ForceUnroll]
+            for (uint col = 0; col < 7; ++col)
+            {
+                const uint idx = 34 + row * 7 + col;
+                sum += buf[layer].bands[idx >> 2][idx & 3] * c[9 + col];
+            }
+            rotated[row] = sum;
+        }
+        [ForceUnroll]
+        for (uint row = 0; row < 7; ++row)
+        {
+            c[9 + row] = rotated[row];
+        }
+    }
+}
+
+#endif // SABERCAT_EDIT_COMMON_SLANGH

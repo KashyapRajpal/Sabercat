@@ -17,86 +17,15 @@
 #include "sabercat/logger.h"
 #include "sabercat/parallel_for.h"
 #include "sabercat/render_config.h"
+#include "layer_bake_frame.h"
+#include "scene_bounds_compute.h"
 #include "sh_rotation.h"
 #include "unit_quaternion.h"
 
 namespace sabercat
 {
 
-namespace
-{
-
-// The canonical layout holds 16 coefficients, i.e. degree 3.
-constexpr uint32_t kMaxDegree = 3;
-
-// The glTF reader's unit-quaternion tolerance (gltf_reader.cpp): a float
-// quaternion this close to unit length is passed through, otherwise renormalized.
-constexpr float kUnitQuaternionTolerance = 1e-6f;
-
-// Rejects a placement that cannot be baked: non-finite values, a scale that is
-// not positive, or a rotation that is not unit length.
-void validateTransform(const LayerTransform & transform, const std::string & where)
-{
-    const glm::quat & q = transform.rotation;
-    const float values[] = {q.w,
-                            q.x,
-                            q.y,
-                            q.z,
-                            transform.translation.x,
-                            transform.translation.y,
-                            transform.translation.z,
-                            transform.scale};
-    for (const float value : values)
-    {
-        if (!std::isfinite(value))
-        {
-            throw std::runtime_error(where + " has a non-finite value");
-        }
-    }
-    if (!(transform.scale > 0.0f))
-    {
-        throw std::runtime_error(where + " scale must be > 0");
-    }
-    // A layer placement that a project would refuse to save is refused here too.
-    if (!isUnitLength(q.w, q.x, q.y, q.z))
-    {
-        throw std::runtime_error(where + " rotation is not unit length");
-    }
-}
-
-// Which optional relight streams a bake carries across.
-struct StreamPresence
-{
-    bool normals = false;
-    bool baseColorRoughness = false;
-    bool metallic = false;
-    bool visibility = false;
-};
-
-StreamPresence presenceOf(const GaussianCloud & cloud)
-{
-    const GaussianCloud & c = cloud;
-    StreamPresence presence;
-    presence.normals = !c.normals().empty();
-    presence.baseColorRoughness = !c.baseColorRoughness().empty();
-    presence.metallic = !c.metallic().empty();
-    presence.visibility = !c.visibility().empty();
-    return presence;
-}
-
-// A layer's node transform, decomposed exactly as the glTF reader does it for a
-// node (nodeLocalMatrix, then decomposeTransform), so the baked numbers match
-// what the reader produces from the same .glb.
-struct BakeFrame
-{
-    glm::dmat4 matrix{1.0};                                      // T * R * S
-    sh_rotation::Mat3 rotation{};                                // rotation factor
-    std::array<double, 4> rotationQuaternion{0.0, 0.0, 0.0, 1.0}; // xyzw
-    double uniformScale = 1.0;
-    std::array<sh_rotation::BandMatrix, 3> shBands{}; // bands 1..3
-};
-
-BakeFrame makeFrame(const LayerTransform & transform)
+BakeFrame makeBakeFrame(const LayerTransform & transform)
 {
     // nodeLocalMatrix(): matrix[c][row] = R[row][c] * s, translation in column 3.
     const glm::quat & q = transform.rotation;
@@ -140,6 +69,67 @@ BakeFrame makeFrame(const LayerTransform & transform)
         frame.shBands[band - 1] = sh_rotation::shBandRotation(band, frame.rotation);
     }
     return frame;
+}
+
+// Rejects a placement that cannot be baked: non-finite values, a scale that is
+// not positive, or a rotation that is not unit length.
+void validateLayerTransform(const LayerTransform & transform, const std::string & where)
+{
+    const glm::quat & q = transform.rotation;
+    const float values[] = {q.w,
+                            q.x,
+                            q.y,
+                            q.z,
+                            transform.translation.x,
+                            transform.translation.y,
+                            transform.translation.z,
+                            transform.scale};
+    for (const float value : values)
+    {
+        if (!std::isfinite(value))
+        {
+            throw std::runtime_error(where + " has a non-finite value");
+        }
+    }
+    if (!(transform.scale > 0.0f))
+    {
+        throw std::runtime_error(where + " scale must be > 0");
+    }
+    // A layer placement that a project would refuse to save is refused here too.
+    if (!isUnitLength(q.w, q.x, q.y, q.z))
+    {
+        throw std::runtime_error(where + " rotation is not unit length");
+    }
+}
+
+namespace
+{
+
+// The canonical layout holds 16 coefficients, i.e. degree 3.
+constexpr uint32_t kMaxDegree = 3;
+
+// The glTF reader's unit-quaternion tolerance (gltf_reader.cpp): a float
+// quaternion this close to unit length is passed through, otherwise renormalized.
+constexpr float kUnitQuaternionTolerance = 1e-6f;
+
+// Which optional relight streams a bake carries across.
+struct StreamPresence
+{
+    bool normals = false;
+    bool baseColorRoughness = false;
+    bool metallic = false;
+    bool visibility = false;
+};
+
+StreamPresence presenceOf(const GaussianCloud & cloud)
+{
+    const GaussianCloud & c = cloud;
+    StreamPresence presence;
+    presence.normals = !c.normals().empty();
+    presence.baseColorRoughness = !c.baseColorRoughness().empty();
+    presence.metallic = !c.metallic().empty();
+    presence.visibility = !c.visibility().empty();
+    return presence;
 }
 
 // Gives `out` storage for every stream in `keep`, sized for `count` Gaussians.
@@ -197,7 +187,7 @@ void bakeLayer(const GaussianCloud & source, const LayerTransform & transform, G
     const size_t sourceDegree = std::min(src.shDegree(), kMaxDegree);
     const size_t keptCoefficients = (sourceDegree + 1) * (sourceDegree + 1);
     const bool identity = transform.isIdentity();
-    const BakeFrame frame = makeFrame(transform);
+    const BakeFrame frame = makeBakeFrame(transform);
     const sh_rotation::Mat3 & rot = frame.rotation;
 
     auto & dp = dst.positions();
@@ -349,7 +339,7 @@ bool LayerTransform::isIdentity() const
 std::shared_ptr<GaussianCloud> transformedCopy(Device & device, const GaussianCloud & source,
                                                const LayerTransform & transform)
 {
-    validateTransform(transform, "transformedCopy: transform");
+    validateLayerTransform(transform, "transformedCopy: transform");
     const size_t count = source.count();
     const StreamPresence keep = presenceOf(source);
 
@@ -384,7 +374,8 @@ std::shared_ptr<GaussianCloud> mergeLayers(
         {
             throw std::runtime_error("mergeLayers: layer " + std::to_string(i) + " has no cloud");
         }
-        validateTransform(layer.second, "mergeLayers: layer " + std::to_string(i) + " transform");
+        validateLayerTransform(layer.second,
+                               "mergeLayers: layer " + std::to_string(i) + " transform");
         total += cloud->count();
         degree = std::max(degree, cloud->shDegree());
         antialiased = antialiased && cloud->antialiased();
@@ -426,6 +417,72 @@ std::shared_ptr<GaussianCloud> mergeLayers(
     out->setAntialiased(antialiased);
     out->computeBounds();
     return out;
+}
+
+SceneBounds mergedLayerBounds(
+    const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers)
+{
+    if (layers.empty())
+    {
+        return SceneBounds{};
+    }
+
+    // Validate every layer before any work, and size the transient array once.
+    size_t total = 0;
+    for (size_t i = 0; i < layers.size(); ++i)
+    {
+        const std::string index = std::to_string(i);
+        const GaussianCloud * cloud = layers[i].first;
+        if (cloud == nullptr)
+        {
+            throw std::runtime_error("mergedLayerBounds: layer " + index + " has no cloud");
+        }
+        validateLayerTransform(layers[i].second,
+                               "mergedLayerBounds: layer " + index + " transform");
+        if (cloud->positions().size() != cloud->count())
+        {
+            throw std::runtime_error("mergedLayerBounds: layer " + index
+                                     + " has no host positions (sync it from the GPU first)");
+        }
+        total += cloud->count();
+    }
+
+    // The same per-Gaussian position transform as bakeLayer, layer by layer in order,
+    // so the array holds exactly what mergeLayers() bakes, bit for bit.
+    std::vector<glm::vec4> positions(total);
+    size_t first = 0;
+    for (const auto & layer : layers)
+    {
+        const GaussianCloud & src = *layer.first;
+        const auto & sp = src.positions();
+        const size_t count = src.count();
+        const bool identity = layer.second.isIdentity();
+        const BakeFrame frame = makeBakeFrame(layer.second);
+        glm::vec4 * dp = positions.data() + first;
+        parallelFor(count,
+                    [&](size_t begin, size_t end)
+                    {
+                        for (size_t i = begin; i < end; ++i)
+                        {
+                            if (identity)
+                            {
+                                dp[i] = sp[i];
+                            }
+                            else
+                            {
+                                const glm::vec4 p = sp[i];
+                                const glm::dvec4 world =
+                                    frame.matrix * glm::dvec4(p.x, p.y, p.z, 1.0);
+                                dp[i] = glm::vec4(static_cast<float>(world.x),
+                                                  static_cast<float>(world.y),
+                                                  static_cast<float>(world.z),
+                                                  0.0f);
+                            }
+                        }
+                    });
+        first += count;
+    }
+    return computeSceneBounds(positions.data(), positions.size());
 }
 
 } // namespace sabercat

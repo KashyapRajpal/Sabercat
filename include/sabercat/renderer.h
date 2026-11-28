@@ -8,9 +8,13 @@
 #include <glm/glm.hpp>
 
 #include "sabercat/buffer_view.h"
+#include "sabercat/camera.h"
+#include "sabercat/highlight_settings.h"
+#include "sabercat/layer_transform.h"
 #include "sabercat/lighting.h"
 #include "sabercat/render_config.h"
 #include "sabercat/scene_bounds.h"
+#include "sabercat/sort_settings.h"
 
 #include <cstdint>
 #include <functional>
@@ -29,6 +33,7 @@ struct VulkanContext;
 struct EnabledDeviceFeatures;
 struct BorrowedGaussians;
 class Device;
+class EditPass;
 
 // What forward() renders for. Viewer honors the viewer-only knobs
 // (setLODParams: geometry/appearance LOD, minScreenRadius); Differentiable
@@ -96,6 +101,13 @@ enum class DebugView
     // the contributing Gaussians' (band-faded, so fractional) degrees, as a
     // blue(0) -> green -> yellow -> red(3) heatmap scaled by coverage.
     SHDegree,
+};
+
+// Display scales for the debug views. The defaults are the ones present() uses.
+struct DebugViewScales
+{
+    float depth = 50.0f;   // Depth view: front depth / depth -> [0,1] grayscale
+    float density = 64.0f; // TileDensity view: instances per tile / density -> [0,1] heat
 };
 
 // Frames-in-flight count (PERFORMANCE.md design rule 3): command buffers,
@@ -253,6 +265,27 @@ class Renderer
     // initialize()'s forward pass is built.
     void setLODParams(const LODParams & params);
 
+    // Sort order for the forward pass (see SortMode). Viewer only:
+    // RenderMode::Differentiable always uses SortMode::Default, whatever is set
+    // here, because BackwardPass assumes the default order. Validates first and
+    // throws std::invalid_argument naming the field.
+    // With lighting enabled, forward(RenderMode::Viewer) also throws for the
+    // modes where sortModeIncompatibleWithLighting() is true (PixelWindow,
+    // Hybrid, Stochastic): they change the color order but not the relight
+    // G-buffer, so the lit image would disagree with it. The refusal is Viewer
+    // only; a Differentiable forward always uses the default order, so lighting
+    // is fine there. Changing the value invalidates cached frames.
+    void setSortSettings(const SortSettings & settings);
+    const SortSettings & sortSettings() const;
+
+    // Opt-in GPU stage timing for the forward pass (see ForwardPass::
+    // setStageTimingEnabled). Off by default; it adds no GPU commands while off.
+    void setStageTimingEnabled(bool enabled);
+    // Per-stage times of the last forward(). All NaN with valid == false when
+    // timing is off, unsupported, or the forward did not stamp (capacity
+    // re-run, or no forward() yet).
+    const ForwardStageTimings & lastStageTimings() const;
+
     // Max spherical-harmonic degree to evaluate, clamped to
     // [0, 3]. Degree 0 is the flat DC term (no view-dependent color); 3 is
     // full quality and the default, so a caller that never touches this sees
@@ -300,6 +333,66 @@ class Renderer
     // Whether the current scene's parameter streams are borrowed.
     bool gaussiansBorrowed() const;
 
+    // Replaces the scene with the merge of GPU-resident layer clouds, each placed by its
+    // LayerTransform. The layers' GPU streams are read (owned or borrowed); their host
+    // copies are not. The rules are the host mergeLayers()' rules: SH degree = max,
+    // antialiased only if every layer is, and a relight stream is kept only if every
+    // layer has it (one warning per dropped stream). Throws on an empty list, a null
+    // layer, an invalid transform, or a layer that is the current scene; a throw before
+    // the merge starts leaves the current scene in place.
+    //
+    // Storage: when the current scene is owned, has capacity for the merged count and
+    // has exactly the merged relight streams, the merge writes into its buffers
+    // (storageGeneration() does not move, gaussianCount() becomes the merged count).
+    // Otherwise the merged scene gets newly allocated buffers and storageGeneration()
+    // advances. A throw partway through the in-place merge leaves the scene partly
+    // merged; the renderer still records the change, so nothing stale is reused.
+    // After a merge (either path) readImage(), readLitImage(), imageView() and the
+    // debug views throw until the next forward(), as after clearScene().
+    //
+    // The merged scene has no host copy, so sceneBounds() is invalid afterwards until
+    // setSceneBounds() sets it (mergedLayerBounds() computes the exact bounds from the
+    // layers' host positions). To clear the scene instead, use clearScene().
+    //
+    // The renderer records the change itself: cached shadows are recomputed, and so
+    // markSceneChanged() is not needed. When the merge keeps the Gaussian count and the
+    // layout in place, the acceleration structure is refit on the next shadowed frame
+    // rather than rebuilt (ShadowFrameStats::accelerationRefits).
+    //
+    // Synchronous, on the submit queue (see the synchronization contract in
+    // docs/library.md). Needs a shader directory (initialize() with one).
+    void mergeLayersOnGpu(
+        const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers);
+
+    // The renderer's edit kernels (EditPass: selection, the layer stream edits, the
+    // mask operations), created on the first call. The Studio drives selection and
+    // edits through it. Every call is a synchronous submission on the renderer's
+    // single queue (the synchronization contract in docs/library.md), so a frame
+    // never overlaps an edit. Needs a shader directory (initialize() with one). The
+    // object is destroyed by shutdown().
+    EditPass & editPass();
+
+    // --- Selection highlight ---
+    //
+    // Tints the selected Gaussians of the scene the last mergeLayersOnGpu() produced.
+    // layerMasks holds the SelectionMask::view() of each layer, in the order the
+    // layers were given to mergeLayersOnGpu(). Each layer's bits are gathered into one
+    // merged mask on the GPU; the merged mask is a SNAPSHOT, so call this again after
+    // the selection changes. The layer count must match the last merge, else
+    // std::invalid_argument; a scene that is not a layer merge throws std::runtime_error.
+    // settings.enabled == 0 clears the highlight, and layerMasks may then be empty.
+    //
+    // While enabled, forward(RenderMode::Viewer) moves each selected Gaussian's color
+    // toward settings.tint[0..2] by tint[3], right after projection. The tint shows in
+    // the unlit color image (readImage(), present() and DebugView::Final) and NOT in
+    // the lit image, which shades the G-buffer and never reads the color. A
+    // Differentiable forward ignores it. Any scene change disables it, including the
+    // merge itself: apply it again afterwards. Synchronous. Like any change of the
+    // visible image, it ends the rendered frame: readImage() and the debug views throw
+    // until the next forward().
+    void setSelectionHighlight(const std::vector<BufferView> & layerMasks,
+                               const HighlightSettings & settings);
+
     // --- Resizable storage (densification) ---
     //
     // std::vector semantics over the GPU streams. gaussianCapacity() is how
@@ -342,6 +435,15 @@ class Renderer
     // Viewer (default) is the real-time path; Differentiable is what a
     // training step must use before backward().
     void forward(RenderMode mode = RenderMode::Viewer);
+
+    // The camera uniforms the last COMPLETED forward() of the current scene pushed:
+    // the up-axis flip, the intrinsics and the rasterizer's own flag bits, exactly as
+    // the rasterizer saw them. A Rectangle selection (EditPass::select) projects with
+    // exactly this camera and selects through all depths, so the screen rectangle
+    // matches the image the user sees. Throws std::runtime_error when there is no
+    // completed forward() of the current scene (a scene change ends it: call forward()
+    // again).
+    CameraUniforms lastForwardCamera() const;
 
     // Backward: given dL/d(output image), compute dL/d(Gaussian params) into
     // the gradient buffers -- OVERWRITING them (pure function; summing views
@@ -403,6 +505,26 @@ class Renderer
     // only on a resize; contents are valid from forward() returning until
     // the next forward(). Same throw rules as readDepth().
     BufferView depthView() const;
+
+    // Runs `view` over the last forward() (either RenderMode) into a headless
+    // image and returns it as a device buffer of width*height RGBA floats,
+    // row-major (stride 16, offset 0), display-referred: exactly what
+    // present() shows for that view with the same scales. DebugView::Final
+    // is the forward color image (the readImage() values, bit for bit) -- not
+    // the lit image. Does not re-run forward() and writes nothing forward()
+    // or backward() read, so it may be called any number of times, and after
+    // present(). Throws before any forward(), after the scene changed since
+    // the last forward() (loadScene, setGaussians, ..., clearScene) or a
+    // resize, and if the last forward() did not complete; also if the
+    // renderer was initialized without a shader directory, or a scale is not
+    // positive. The buffer is allocated on the first call (nothing is paid by
+    // an app that never calls this). One buffer is reused: its handle is
+    // stable across calls and changes only on a resize, and its contents are
+    // valid until the next renderDebugView()/readDebugView() or resize.
+    // Validity rules: see docs/library.md.
+    BufferView renderDebugView(DebugView view, const DebugViewScales & scales = {});
+    // Host copy of renderDebugView(): width*height RGBA floats, row-major.
+    std::vector<float> readDebugView(DebugView view, const DebugViewScales & scales = {});
 
     // --- Relighting ---
     //
@@ -480,10 +602,11 @@ class Renderer
     // acceleration structure is rebuilt, and cached or progressively
     // accumulated shadows restarted, only when the scene could have changed.
     // The renderer sees every change to an owned scene made through its API
-    // (load, setGaussians, reserve, setGaussianCount), but not in-place GPU
+    // (load, setGaussians, reserve, setGaussianCount, mergeLayersOnGpu), but not in-place GPU
     // writes: once gaussianViews() is handed out, or the scene is borrowed,
     // it stops reusing for that scene and rebuilds every frame. Call this
-    // after editing parameters in place through any other route.
+    // after editing parameters in place through any other route. It always
+    // forces a full acceleration-structure rebuild, never a refit.
     void markSceneChanged();
     // What the last lit forward() did for visibility: rays dispatched,
     // acceleration-structure builds, frame-cache reuse, progressive state.
@@ -519,8 +642,15 @@ class Renderer
     // loads. Scene scale varies by orders of magnitude across formats and
     // datasets -- the .spz samples are ~500 units across where a reference
     // .ply sits a few units from the origin -- so a viewer needs this to place
-    // a camera that can actually see what it loaded.
+    // a camera that can actually see what it loaded. After mergeLayersOnGpu()
+    // (no host copy) they are invalid until setSceneBounds() sets them.
     SceneBounds sceneBounds() const;
+    // Sets the bounds of the current scene: the exact ones from mergedLayerBounds()
+    // after a merge, or the caller's own for a borrowed scene. Shadows that take their
+    // focus from the bounds (ShadowSettings::focusRadius <= 0) change with them, so
+    // cached shadows are recomputed when the bounds change. Nothing else is affected.
+    // Throws without a scene.
+    void setSceneBounds(const SceneBounds & bounds);
     // Max spherical-harmonic degree the LOADED SCENE actually carries, as
     // discovered by its loader -- not the cap set by setMaxSHDegree(). A
     // .splat is always 0 (DC-only), so the viewer can say so instead of

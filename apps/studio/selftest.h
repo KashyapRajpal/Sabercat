@@ -1,8 +1,9 @@
 // Copyright 2026 Kashyap Rajpal
 // SPDX-License-Identifier: Apache-2.0
 
-// Headless self-test for the Studio's document layer: project save/load, PLY
-// and glTF export, reload, and one forward frame. No window, no ImGui. With no
+// Headless self-test for the Studio's document layer (project save/load, PLY
+// and glTF export, reload, one forward frame) and its GPU editing model (merge,
+// selection, transform, undo and redo, exports). No window, no ImGui. With no
 // scene files it builds a synthetic two-layer project.
 #pragma once
 

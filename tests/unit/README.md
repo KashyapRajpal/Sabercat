@@ -15,6 +15,13 @@ window, so they run on the hosted CI runner.
   (`apps/common/file_dialog.h`). No dialog is shown.
 - `test_surface_format.cpp` covers the swapchain format choice
   (`src/renderer/surface_format.h`), which needs a UNORM format.
+- `test_image_compare.cpp` covers the comparison library
+  (`apps/compare/image_compare.h`): PSNR, FLIP, the difference map, the magma
+  map and the sRGB table. Its PNG checks (`image_io.h`, WIC) run on Windows and
+  confirm 8- and 16-bit decoding with no gamma conversion or premultiplication.
+- `sabercat_compare_flip_reference` (`compare_flip_reference.cpp`, CTest
+  `compare_flip_reference`, timeout 900 s) runs the full-resolution FLIP checks
+  against NVlabs' reference values; a Debug run takes about two minutes.
 - `test_system_info.cpp` covers the system-info text, the session log naming and
   pruning, and the Logger's file mirror.
 - `test_file_association.cpp` covers the per-user `.sabercat` association: the

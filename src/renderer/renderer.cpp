@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 #include "sabercat/backward_pass.h"
@@ -14,6 +15,7 @@
 #include "sabercat/camera.h"
 #include "sabercat/debug_visualizer.h"
 #include "sabercat/device.h"
+#include "sabercat/edit_pass.h"
 #include "sabercat/forward_pass.h"
 #include "sabercat/gaussian_acceleration_structure.h"
 #include "sabercat/gaussian_cloud.h"
@@ -25,6 +27,7 @@
 #include "sabercat/visibility_pass.h"
 #include "sabercat/vk_check.h"
 
+#include "highlight_pass.h"
 #include "present_blit.h"
 #include "surface_format.h"
 
@@ -33,13 +36,6 @@ namespace sabercat
 
 namespace
 {
-
-// Rough defaults for the Depth/TileDensity debug views -- there's no scene-
-// bounds tracking to derive a real near/far range from yet, so these are
-// fixed "reasonable scene scale" constants, not measured. Revisit once a
-// real scene makes them feel wrong.
-constexpr float kDebugDepthScale = 50.0f;
-constexpr float kDebugDensityScale = 64.0f;
 
 // Names for the swapchain-format log line; other values print their number.
 std::string surfaceFormatName(VkFormat format)
@@ -64,6 +60,44 @@ std::string colorSpaceName(VkColorSpaceKHR space)
     return space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
                ? "SRGB_NONLINEAR"
                : "VkColorSpaceKHR " + std::to_string(static_cast<int>(space));
+}
+
+// A refit keeps the BVH topology of the last build, so trace quality decays with
+// each one; past this many refits the next change rebuilds instead.
+constexpr uint32_t kMaxRefitsBeforeRebuild = 16;
+
+// Whether a cloud's relight streams are exactly the ones `presence` names.
+bool relightPresenceMatches(const GaussianCloud & cloud, const RelightPresence & presence)
+{
+    const RelightBufferViews & relight = cloud.relightViews();
+    return relight.normals.valid() == presence.normals
+           && relight.baseColorRoughness.valid() == presence.baseColorRoughness
+           && relight.metallic.valid() == presence.metallic
+           && relight.visibility.valid() == presence.visibility;
+}
+
+// Clears a cloud's host copy. After an in-place merge the host vectors describe the
+// old contents, which may still have the merged count, so they must never be read
+// as the merged scene. The merged scene has no host copy.
+void dropHostCopy(GaussianCloud & cloud)
+{
+    cloud.positions().clear();
+    cloud.scales().clear();
+    cloud.rotations().clear();
+    cloud.shCoefficients().clear();
+    cloud.opacities().clear();
+    cloud.times().clear();
+    cloud.normals().clear();
+    cloud.baseColorRoughness().clear();
+    cloud.metallic().clear();
+    cloud.visibility().clear();
+}
+
+// Equal in every field (memcmp would read SceneBounds' padding).
+bool sameBounds(const SceneBounds & a, const SceneBounds & b)
+{
+    return a.valid == b.valid && a.min == b.min && a.max == b.max
+           && a.focusCenter == b.focusCenter && a.focusRadius == b.focusRadius;
 }
 
 } // namespace
@@ -98,13 +132,42 @@ class Renderer::Impl
     bool viewsExposed = false;       // gaussianViews() was handed out
     uint64_t contentEdits = 0;       // markSceneChanged()
     uint64_t visibilityEdits = 0;    // bakes (the visibility stream BakedSH reads)
-    uint64_t forwardSettingsEdits = 0; // LOD (the rest reaches CameraUniforms)
+    uint64_t forwardSettingsEdits = 0; // LOD and sort order (the rest reaches CameraUniforms)
     LODParams lodParams{};
+    // Sort order and stage timing. Both are pushed into forwardPass when it is
+    // built (initialize / initializeBorrowed), so they survive a late build.
+    SortSettings sortSettings;
+    // sceneGeneration the Stable sort's sticky keys were last reset for; a new
+    // scene starts them over (see forward()).
+    uint64_t stableGeneration = UINT64_MAX;
+    // sceneGeneration the Stochastic history was last reset for; a new scene
+    // starts it over (see forward()).
+    uint64_t stochasticGeneration = UINT64_MAX;
+    bool stageTiming = false;
+    // What lastStageTimings() returns before a forward pass exists: all NaN, invalid.
+    ForwardStageTimings noTimings;
     uint64_t frameCacheKey = 0;
     bool frameCacheValid = false;
     std::array<uint64_t, kMaxLights> progressiveKey{};
     std::array<uint32_t, kMaxLights> progressiveSamples{};
     ShadowFrameStats shadowStats;
+    // Built on the first mergeLayersOnGpu().
+    std::unique_ptr<EditPass> editPass;
+    // Built on the first setSelectionHighlight(): merges the layers' selection masks
+    // into one scene-wide mask on the GPU.
+    std::unique_ptr<HighlightPass> highlightPass;
+    // The highlight as setSelectionHighlight() stored it; enabled == 0 is none. Any
+    // scene change ends it (dropHighlight()).
+    HighlightSettings highlight;
+    // Gaussians per layer of the last mergeLayersOnGpu(), in layer order: the layers'
+    // ranges in the merged scene, which setSelectionHighlight() checks its masks
+    // against. Empty unless the scene is that merge; every other scene change clears it.
+    std::vector<uint32_t> mergedLayerCounts;
+    // Whether the last content change left the acceleration structure's layout
+    // alone (the same Gaussian count and parameter streams), so a refit brings it
+    // current. Every other change clears it: a rebuild is the only safe answer.
+    bool refitEligible = false;
+    uint64_t boundsEdits = 0; // setSceneBounds() changes (the shadow focus reads them)
 
     bool sceneTracked() const
     {
@@ -126,16 +189,29 @@ class Renderer::Impl
             accelerationStructure = std::make_unique<GaussianAccelerationStructure>(device, shaderDir);
             accelerationValid = false;
         }
+        // A merge that kept the Gaussian count and layout only changed parameters:
+        // a refit brings the structure current without a rebuild.
+        if (tracked && accelerationValid && accelerationKey != sceneKey() && refitEligible
+            && accelerationStructure->minAlpha() == minAlpha
+            && accelerationStructure->gaussianCount() == gaussianCloud->count()
+            && accelerationStructure->refitsSinceBuild() < kMaxRefitsBeforeRebuild)
+        {
+            accelerationStructure->refit(gaussianCloud->views());
+            accelerationKey = sceneKey();
+            ++shadowStats.accelerationRefits;
+        }
         // The structure is built for one alpha cutoff (shadow approximations vs
         // the exact bake/teacher): a different one is a rebuild.
-        if (!tracked || !accelerationValid || accelerationKey != sceneKey()
-            || accelerationStructure->minAlpha() != minAlpha)
+        else if (!tracked || !accelerationValid || accelerationKey != sceneKey()
+                 || accelerationStructure->minAlpha() != minAlpha)
         {
             accelerationStructure->build(gaussianCloud->views(), minAlpha);
             accelerationKey = sceneKey();
             accelerationValid = true;
             ++shadowStats.accelerationBuilds;
         }
+        // Also when neither ran: the frame reports the structure's current count.
+        shadowStats.accelerationRefitsSinceBuild = accelerationStructure->refitsSinceBuild();
         return *accelerationStructure;
     }
     ShadowSettings shadowSettings;
@@ -170,6 +246,51 @@ class Renderer::Impl
         return *visibilityPass;
     }
 
+    EditPass & ensureEditPass()
+    {
+        if (!editPass)
+        {
+            VK_VALIDATE(!shaderDir.empty(),
+                        "Renderer::editPass: needs a shader directory "
+                        "(initialize() with one)");
+            editPass = std::make_unique<EditPass>(device, shaderDir);
+        }
+        return *editPass;
+    }
+
+    // Nothing rendered so far survives a change of the scene: readImage(),
+    // imageView(), readLitImage() and the debug views throw until the next forward().
+    // The shadow stats are kept, so the last frame's stats stay readable.
+    void invalidateFrames()
+    {
+        differentiableGeneration = UINT64_MAX;
+        hasRenderedFrame = false;
+        hasLitFrame = false;
+        frameCacheValid = false;
+        progressiveKey.fill(0);
+        progressiveSamples.fill(0);
+    }
+
+    // A scene change ends the selection highlight: the merged mask and the layer
+    // ranges describe the scene that just changed. The caller applies the highlight
+    // again (its settings and masks are not kept).
+    void dropHighlight()
+    {
+        highlight.enabled = 0;
+        mergedLayerCounts.clear();
+    }
+
+    // Records a change to the scene's content: everything derived from the old
+    // content is stale. `refittable` says the change kept the acceleration
+    // structure's layout (see refitEligible).
+    void noteSceneEdit(bool refittable)
+    {
+        ++sceneGeneration;
+        ++contentEdits;
+        refitEligible = refittable;
+        dropHighlight();
+    }
+
     // Installs a freshly uploaded cloud in place of the current one.
     void replaceCloud(std::shared_ptr<GaussianCloud> cloud)
     {
@@ -180,6 +301,8 @@ class Renderer::Impl
         gaussianCloud = std::move(cloud);
         ++sceneGeneration;
         viewsExposed = false; // views of the old cloud say nothing about this one
+        refitEligible = false;
+        dropHighlight();
     }
 
     // Whether the last forward() was a completed Differentiable run of the
@@ -194,6 +317,32 @@ class Renderer::Impl
         }
         const ForwardRunRecord & last = forwardPass->lastRun();
         return last.valid && last.completed && last.mode == ForwardMode::Differentiable;
+    }
+
+    // Whether the last forward() (either mode) completed on the current scene
+    // at the current size: what renderDebugView() reads.
+    bool hasCompletedForward() const
+    {
+        if (!forwardPass || !gaussianCloud || !hasRenderedFrame
+            || renderedGeneration != sceneGeneration)
+        {
+            return false;
+        }
+        const ForwardRunRecord & last = forwardPass->lastRun();
+        return last.valid && last.completed;
+    }
+
+    // present(DebugView::Final) leaves the forward color image in
+    // TRANSFER_SRC_OPTIMAL; the debug-view paths expect GENERAL (what forward()
+    // leaves), so they restore it first.
+    void restoreOutputToGeneral(VkCommandBuffer cmd)
+    {
+        if (outputInTransferSrc)
+        {
+            forwardPass->outputImage().transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                        VK_IMAGE_LAYOUT_GENERAL);
+            outputInTransferSrc = false;
+        }
     }
 
     // Shared precondition + lazy setup for both backward() overloads.
@@ -215,6 +364,14 @@ class Renderer::Impl
     Camera camera;
     DebugView debugView = DebugView::Final;
     bool hasRenderedFrame = false;
+    // sceneGeneration at the last COMPLETED forward() of either mode
+    // (UINT64_MAX while one runs or none ran). renderDebugView() refuses a
+    // scene that has changed since.
+    uint64_t renderedGeneration = UINT64_MAX;
+    // present(DebugView::Final) leaves the forward color image in
+    // TRANSFER_SRC_OPTIMAL; the debug-view paths expect GENERAL (what forward()
+    // leaves), so they restore it first. Cleared by forward().
+    bool outputInTransferSrc = false;
     bool flipUpAxis = false;
     // Full quality by default -- lowering this is opt-in.
     uint32_t maxSHDegree = kShDegree;
@@ -542,6 +699,8 @@ bool Renderer::initialize(const std::vector<const char *> & instanceExtensions,
             m_impl->shaderDir = shaderDir;
             m_impl->forwardPass = std::make_unique<ForwardPass>(m_impl->device, m_width, m_height,
                                                                 shaderDir, m_depthLayout);
+            m_impl->forwardPass->setSortSettings(m_impl->sortSettings);
+            m_impl->forwardPass->setStageTimingEnabled(m_impl->stageTiming);
             m_impl->debugVisualizer =
                 std::make_unique<DebugVisualizer>(m_impl->device, m_width, m_height, shaderDir);
         }
@@ -565,6 +724,8 @@ void Renderer::initializeBorrowed(const VulkanContext & context,
         m_impl->shaderDir = shaderDir;
         m_impl->forwardPass = std::make_unique<ForwardPass>(m_impl->device, m_width, m_height,
                                                             shaderDir, m_depthLayout);
+        m_impl->forwardPass->setSortSettings(m_impl->sortSettings);
+        m_impl->forwardPass->setStageTimingEnabled(m_impl->stageTiming);
         m_impl->debugVisualizer =
             std::make_unique<DebugVisualizer>(m_impl->device, m_width, m_height, shaderDir);
     }
@@ -611,6 +772,8 @@ void Renderer::shutdown()
     m_impl->shadowPass.reset();
     m_impl->relightPass.reset();
     m_impl->forwardPass.reset();
+    m_impl->highlightPass.reset();
+    m_impl->editPass.reset();
     m_impl->debugVisualizer.reset();
     m_impl->gaussianCloud.reset();
     m_impl->device.shutdown();
@@ -752,6 +915,40 @@ void Renderer::setLODParams(const LODParams & params)
     }
 }
 
+void Renderer::setSortSettings(const SortSettings & settings)
+{
+    validateSortSettings(settings);
+    // Every field is 4 bytes with no padding, so a byte compare is a field compare.
+    if (std::memcmp(&settings, &m_impl->sortSettings, sizeof(SortSettings)) != 0)
+    {
+        m_impl->sortSettings = settings;
+        ++m_impl->forwardSettingsEdits;
+    }
+    if (m_impl->forwardPass)
+    {
+        m_impl->forwardPass->setSortSettings(settings);
+    }
+}
+
+const SortSettings & Renderer::sortSettings() const
+{
+    return m_impl->sortSettings;
+}
+
+void Renderer::setStageTimingEnabled(bool enabled)
+{
+    m_impl->stageTiming = enabled;
+    if (m_impl->forwardPass)
+    {
+        m_impl->forwardPass->setStageTimingEnabled(enabled);
+    }
+}
+
+const ForwardStageTimings & Renderer::lastStageTimings() const
+{
+    return m_impl->forwardPass ? m_impl->forwardPass->lastStageTimings() : m_impl->noTimings;
+}
+
 void Renderer::setMaxSHDegree(uint32_t degree)
 {
     m_impl->maxSHDegree = std::min(degree, kShDegree);
@@ -832,18 +1029,15 @@ void Renderer::clearScene()
     }
     // Nothing rendered from the old scene survives: readImage(), imageView()
     // and readLitImage() throw until the next forward(), and present() clears.
-    m_impl->differentiableGeneration = UINT64_MAX;
-    m_impl->hasRenderedFrame = false;
-    m_impl->hasLitFrame = false;
-    m_impl->frameCacheValid = false;
-    m_impl->progressiveKey.fill(0);
-    m_impl->progressiveSamples.fill(0);
+    m_impl->invalidateFrames();
+    m_impl->dropHighlight();
     m_impl->shadowStats = ShadowFrameStats{};
     m_impl->litUniforms = CameraUniforms{};
     // Derived from the old scene: the shared acceleration structure, the
     // baked visibility and the teacher samples (held by the visibility pass).
     m_impl->accelerationStructure.reset();
     m_impl->accelerationValid = false;
+    m_impl->refitEligible = false;
     m_impl->visibilityPass.reset();
     // Frees the owned GPU buffers. A borrowed scene's buffers are the
     // application's and are left alone. storageGeneration() must still move
@@ -853,6 +1047,118 @@ void Renderer::clearScene()
     m_impl->viewsExposed = false;
     markSceneChanged();
     ++m_impl->sceneGeneration;
+}
+
+void Renderer::mergeLayersOnGpu(
+    const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers)
+{
+    // Validates every transform, and warns once per relight stream the merge drops.
+    const MergedLayout layout = planLayerMerge(layers);
+    VK_VALIDATE(layout.count > 0, "Renderer::mergeLayersOnGpu: the layers hold no Gaussians");
+    for (const auto & layer : layers)
+    {
+        VK_VALIDATE(layer.first != m_impl->gaussianCloud.get(),
+                    "Renderer::mergeLayersOnGpu: a layer is the renderer's current scene, "
+                    "which the merge overwrites");
+    }
+    EditPass & pass = m_impl->ensureEditPass();
+
+    // The current scene's buffers take the result when they can hold it with the
+    // same relight streams. Otherwise the merge goes into a new cloud, installed
+    // only once it has succeeded, so a throw leaves the old scene as it was.
+    GaussianCloud * current = m_impl->gaussianCloud.get();
+    const bool inPlace = current && !current->borrowedParameters()
+                         && current->capacity() >= layout.count
+                         && relightPresenceMatches(*current, layout.presence);
+    std::shared_ptr<GaussianCloud> target;
+    bool sameStructure = false;
+    if (inPlace)
+    {
+        target = m_impl->gaussianCloud;
+        sameStructure = target->count() == layout.count;
+        // The write starts now: nothing derived from the old contents may be
+        // reused, even if the merge throws partway through.
+        m_impl->noteSceneEdit(false);
+        m_impl->invalidateFrames();
+        target->setCount(layout.count);
+        target->setShDegree(layout.shDegree);
+        target->setAntialiased(layout.antialiased);
+        target->setBounds(SceneBounds{});
+        dropHostCopy(*target);
+    }
+    else
+    {
+        target = std::make_shared<GaussianCloud>(m_impl->device);
+        target->allocateGPU(layout.count, 0, layout.presence);
+        target->setShDegree(layout.shDegree);
+        target->setAntialiased(layout.antialiased);
+    }
+
+    pass.mergeLayers(layers, *target);
+
+    if (!inPlace)
+    {
+        m_impl->replaceCloud(std::move(target));
+    }
+    m_impl->invalidateFrames();
+    m_impl->noteSceneEdit(inPlace && sameStructure);
+    // The layers' ranges in the merged scene, for setSelectionHighlight(). Set after
+    // noteSceneEdit, which ends whatever ranges were there before.
+    std::vector<uint32_t> counts;
+    counts.reserve(layers.size());
+    for (const auto & layer : layers)
+    {
+        counts.push_back(static_cast<uint32_t>(layer.first->count()));
+    }
+    m_impl->mergedLayerCounts = std::move(counts);
+}
+
+EditPass & Renderer::editPass()
+{
+    return m_impl->ensureEditPass();
+}
+
+void Renderer::setSelectionHighlight(const std::vector<BufferView> & layerMasks,
+                                     const HighlightSettings & settings)
+{
+    if (settings.enabled == 0)
+    {
+        // Clearing a highlight that is not on changes nothing on screen.
+        if (m_impl->highlight.enabled != 0)
+        {
+            m_impl->highlight.enabled = 0;
+            m_impl->invalidateFrames();
+        }
+        return;
+    }
+
+    VK_VALIDATE(m_impl->gaussianCloud, "Renderer::setSelectionHighlight: no scene loaded");
+    VK_VALIDATE(!m_impl->mergedLayerCounts.empty(),
+                "Renderer::setSelectionHighlight: the scene is not the result of "
+                "mergeLayersOnGpu() (or a scene change ended that merge's layer ranges)");
+    if (layerMasks.size() != m_impl->mergedLayerCounts.size())
+    {
+        throw std::invalid_argument(
+            "Renderer::setSelectionHighlight: " + std::to_string(layerMasks.size())
+            + " layer masks, but the last mergeLayersOnGpu() merged "
+            + std::to_string(m_impl->mergedLayerCounts.size()) + " layers");
+    }
+    if (!m_impl->highlightPass)
+    {
+        VK_VALIDATE(!m_impl->shaderDir.empty(),
+                    "Renderer::setSelectionHighlight: needs a shader directory "
+                    "(initialize() with one)");
+        m_impl->highlightPass = std::make_unique<HighlightPass>(m_impl->device, m_impl->shaderDir);
+    }
+    // The masks are checked before any GPU work. The highlight is stored only once
+    // the merged mask is built, so a throw leaves the previous highlight as it was.
+    m_impl->highlightPass->buildMergedMask(
+        layerMasks, m_impl->mergedLayerCounts,
+        static_cast<uint32_t>(m_impl->gaussianCloud->count()));
+    m_impl->highlight = settings;
+    m_impl->highlight.enabled = 1;
+    // The visible image changes with the tint, so the rendered frame ends here.
+    m_impl->invalidateFrames();
 }
 
 void Renderer::setImageSize(uint32_t width, uint32_t height)
@@ -889,7 +1195,9 @@ bool Renderer::reserveGaussians(uint32_t capacity)
         return false;
     }
     // The last forward's record holds the old handles.
+    m_impl->refitEligible = false;
     ++m_impl->sceneGeneration;
+    m_impl->dropHighlight();
     return true;
 }
 
@@ -897,7 +1205,9 @@ void Renderer::setGaussianCount(uint32_t count)
 {
     VK_VALIDATE(m_impl->gaussianCloud, "Renderer::setGaussianCount: no scene loaded");
     m_impl->gaussianCloud->setCount(count);
+    m_impl->refitEligible = false; // the count changed: the structure must be rebuilt
     ++m_impl->sceneGeneration;
+    m_impl->dropHighlight();
 }
 
 uint32_t Renderer::gaussianCapacity() const
@@ -934,11 +1244,35 @@ void Renderer::readGaussians(const GaussianHostOutput & out)
                 n * kShCoefficientsPerGaussian * 4 * sizeof(float));
 }
 
+CameraUniforms Renderer::lastForwardCamera() const
+{
+    VK_VALIDATE(m_impl->hasCompletedForward(),
+                "Renderer::lastForwardCamera: no completed forward() of the current scene -- "
+                "call forward() first");
+    return m_impl->forwardPass->lastRun().camera;
+}
+
 void Renderer::forward(RenderMode mode)
 {
     if (!m_impl->forwardPass || !m_impl->gaussianCloud || !m_impl->camera.valid())
     {
         return;
+    }
+
+    // The relight G-buffer is always splatted in the default order, so a lit
+    // Viewer frame in a color-reordering mode would disagree with it. Refused
+    // before any work. Differentiable runs always force the default sort (see
+    // ForwardPass::run), so their lit frame agrees with the G-buffer and is not
+    // refused.
+    if (mode != RenderMode::Differentiable && m_impl->lightingEnabled
+        && sortModeIncompatibleWithLighting(m_impl->sortSettings.mode))
+    {
+        throw std::runtime_error(
+            std::string("Renderer::forward: sort mode '")
+            + sortModeName(m_impl->sortSettings.mode)
+            + "' cannot be combined with lighting (it changes the color order but not the "
+              "G-buffer); disable lighting or choose the default, stable or tile-ray-depth "
+              "sort mode");
     }
 
     glm::mat4 worldToCamera = m_impl->camera.worldToCamera();
@@ -988,8 +1322,41 @@ void Renderer::forward(RenderMode mode)
     uniforms.renderFlags = m_impl->gaussianCloud->antialiased() ? kRenderFlagAntialiased : 0u;
     uniforms.cameraPositionWorld = glm::vec4(cameraPosition, 0.0f);
 
+    // Stable's sticky keys are per Gaussian, so a new scene must not inherit the
+    // previous scene's keys. Differentiable runs always use the default order.
+    if (m_impl->sortSettings.mode == SortMode::Stable && mode != RenderMode::Differentiable
+        && m_impl->stableGeneration != m_impl->sceneGeneration)
+    {
+        m_impl->forwardPass->resetStableSort();
+        m_impl->stableGeneration = m_impl->sceneGeneration;
+    }
+    // The Stochastic history blends frames of one scene, so a new scene starts it
+    // over. Differentiable runs never touch it.
+    if (m_impl->sortSettings.mode == SortMode::Stochastic && mode != RenderMode::Differentiable
+        && m_impl->stochasticGeneration != m_impl->sceneGeneration)
+    {
+        m_impl->forwardPass->resetStochastic();
+        m_impl->stochasticGeneration = m_impl->sceneGeneration;
+    }
+
     const bool differentiable = mode == RenderMode::Differentiable;
     m_impl->differentiableGeneration = UINT64_MAX; // until this run completes
+    m_impl->renderedGeneration = UINT64_MAX;       // until this run completes
+    m_impl->outputInTransferSrc = false;           // run() leaves the color image in GENERAL
+    // The selection highlight tints a Viewer forward's unlit color, after projection.
+    // It needs no shadow-cache key: the lit G-buffer never reads that color, and the
+    // shadow frame cache restores visibility, which the color does not feed.
+    // Differentiable runs are never tinted, so they clear it.
+    if (!differentiable && m_impl->highlight.enabled != 0 && m_impl->highlightPass)
+    {
+        m_impl->forwardPass->setHighlight(
+            m_impl->highlightPass->mergedMask().view(static_cast<uint32_t>(sizeof(uint32_t))),
+            m_impl->highlight.tint);
+    }
+    else
+    {
+        m_impl->forwardPass->clearHighlight();
+    }
     m_impl->forwardPass->run(m_impl->gaussianCloud->views(), uniforms, ForwardStage::Rasterize,
                              differentiable ? ForwardMode::Differentiable : ForwardMode::Viewer);
     if (differentiable)
@@ -997,6 +1364,7 @@ void Renderer::forward(RenderMode mode)
         m_impl->differentiableGeneration = m_impl->sceneGeneration;
     }
     m_impl->hasRenderedFrame = true;
+    m_impl->renderedGeneration = m_impl->sceneGeneration;
 
     // G-buffer + deferred lighting (relighting) over this run's sorted lists.
     m_impl->hasLitFrame = false;
@@ -1047,7 +1415,8 @@ void Renderer::forward(RenderMode mode)
                 return h;
             };
             uint64_t baseKey = 0xCBF29CE484222325ull;
-            const uint64_t edits[3] = {m_impl->sceneKey(), m_impl->visibilityEdits, m_impl->forwardSettingsEdits};
+            const uint64_t edits[4] = {m_impl->sceneKey(), m_impl->visibilityEdits,
+                                       m_impl->forwardSettingsEdits, m_impl->boundsEdits};
             baseKey = mix(baseKey, edits, sizeof(edits));
             baseKey = mix(baseKey, &uniforms, sizeof(uniforms));
             baseKey = mix(baseKey, &shadows, sizeof(shadows));
@@ -1340,6 +1709,8 @@ uint32_t Renderer::generateTeacherSamples(const TeacherSettings & settings)
 void Renderer::markSceneChanged()
 {
     ++m_impl->contentEdits;
+    // A user-declared edit says nothing about what changed, so it is never a refit.
+    m_impl->refitEligible = false;
 }
 
 const ShadowFrameStats & Renderer::shadowFrameStats() const
@@ -1492,6 +1863,34 @@ BufferView Renderer::depthView() const
     view.size = buffer.size();
     view.stride = static_cast<uint32_t>(m_depthLayout) * sizeof(float);
     return view;
+}
+
+BufferView Renderer::renderDebugView(DebugView view, const DebugViewScales & scales)
+{
+    VK_VALIDATE(
+        m_impl->forwardPass && m_impl->debugVisualizer,
+        "Renderer::renderDebugView: the renderer was initialized without a shader directory");
+    VK_VALIDATE(m_impl->hasCompletedForward(),
+                "Renderer::renderDebugView: no completed forward() of the current scene -- call "
+                "forward() first");
+    VK_VALIDATE(static_cast<uint32_t>(view) <= static_cast<uint32_t>(DebugView::SHDegree),
+                "Renderer::renderDebugView: unknown DebugView");
+    VK_VALIDATE(scales.depth > 0.0f && scales.density > 0.0f,
+                "Renderer::renderDebugView: the scales must be positive");
+    const VkImageLayout layout = m_impl->outputInTransferSrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_GENERAL;
+    const Buffer & buffer = m_impl->debugVisualizer->renderHeadless(
+        view, *m_impl->forwardPass, scales.depth, scales.density, layout);
+    m_impl->outputInTransferSrc = false;
+    return buffer.view(sizeof(glm::vec4));
+}
+
+std::vector<float> Renderer::readDebugView(DebugView view, const DebugViewScales & scales)
+{
+    const BufferView v = renderDebugView(view, scales);
+    std::vector<float> out(v.size / sizeof(float));
+    downloadView(m_impl->device, v, out.data(), v.size);
+    return out;
 }
 
 CanonicalGaussianBufferViews Renderer::gaussianViews() const
@@ -1658,13 +2057,16 @@ void Renderer::present()
         }
         else if (m_impl->debugView == DebugView::Final)
         {
+            m_impl->restoreOutputToGeneral(frame.cmd);
             m_impl->forwardPass->prepareOutputForRead(frame.cmd);
+            m_impl->outputInTransferSrc = true;
         }
         else
         {
+            m_impl->restoreOutputToGeneral(frame.cmd);
+            const DebugViewScales scales;
             m_impl->debugVisualizer->record(frame.cmd, m_impl->debugView, *m_impl->forwardPass,
-                                            kDebugDepthScale, kDebugDensityScale,
-                                            m_impl->currentFrame);
+                                            scales.depth, scales.density, m_impl->currentFrame);
             source = &m_impl->debugVisualizer->displayImage(m_impl->currentFrame);
         }
 
@@ -1798,6 +2200,17 @@ uint32_t Renderer::gaussianCount() const
 SceneBounds Renderer::sceneBounds() const
 {
     return m_impl->gaussianCloud ? m_impl->gaussianCloud->bounds() : SceneBounds{};
+}
+
+void Renderer::setSceneBounds(const SceneBounds & bounds)
+{
+    VK_VALIDATE(m_impl->gaussianCloud, "Renderer::setSceneBounds: no scene loaded");
+    // Only the shadow focus reads the bounds, so a no-op change keeps the cache.
+    if (!sameBounds(m_impl->gaussianCloud->bounds(), bounds))
+    {
+        ++m_impl->boundsEdits;
+    }
+    m_impl->gaussianCloud->setBounds(bounds);
 }
 
 uint32_t Renderer::sceneSHDegree() const

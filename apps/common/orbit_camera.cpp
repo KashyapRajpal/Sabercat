@@ -13,7 +13,35 @@
 namespace sabercat::app
 {
 
-void updateOrbitCamera(GLFWwindow * window, OrbitCamera & cam, float deltaTime)
+void applyOrbitMouse(OrbitCamera & cam, float deltaX, float deltaY, bool orbit, bool pan, float wheel)
+{
+    constexpr float kOrbitSpeed = 0.005f;
+    constexpr float kPanSpeed = 0.0015f;
+    constexpr float kZoomStep = 0.9f; // multiplicative per scroll notch
+
+    if (orbit)
+    {
+        cam.applyDelta(-deltaX * kOrbitSpeed, -deltaY * kOrbitSpeed, 0.0f);
+    }
+    else if (pan)
+    {
+        // cam.right()/up() come straight from the orientation quaternion
+        // (not cross(forward, worldUp)) so panning stays well-defined
+        // even looking straight up/down, where that cross product would
+        // degenerate the same way the old lookAt reconstruction did.
+        float panScale = kPanSpeed * cam.distance; // fixed pixel drag -> fixed view fraction
+        cam.pivot -= cam.right() * deltaX * panScale;
+        cam.pivot += cam.up() * deltaY * panScale;
+    }
+
+    // Skipped at zero so a frame without scroll never re-clamps the distance.
+    if (wheel != 0.0f)
+    {
+        cam.distance = std::max(OrbitCamera::kMinDistance, cam.distance * std::pow(kZoomStep, wheel));
+    }
+}
+
+void updateOrbitCamera(GLFWwindow * window, OrbitCamera & cam, float deltaTime, bool suppressLeftOrbit)
 {
     static double lastCursorX = 0.0;
     static double lastCursorY = 0.0;
@@ -27,38 +55,18 @@ void updateOrbitCamera(GLFWwindow * window, OrbitCamera & cam, float deltaTime)
     lastCursorY = cursorY;
     haveLastCursor = true;
 
+    // With suppressLeftOrbit the left button orbits only while Alt is held.
+    const bool altHeld = glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS
+                         || glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+    const bool leftOrbitAllowed = !suppressLeftOrbit || altHeld;
+
     const ImGuiIO & io = ImGui::GetIO();
-    if (io.WantCaptureMouse)
+    if (!io.WantCaptureMouse)
     {
-        deltaX = deltaY = 0.0;
-    }
-    else
-    {
-        constexpr float kOrbitSpeed = 0.005f;
-        constexpr float kPanSpeed = 0.0015f;
-        constexpr float kZoomStep = 0.9f; // multiplicative per scroll notch
-
-        if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
-        {
-            cam.applyDelta(-static_cast<float>(deltaX) * kOrbitSpeed,
-                          -static_cast<float>(deltaY) * kOrbitSpeed, 0.0f);
-        }
-        else if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
-        {
-            // cam.right()/up() come straight from the orientation quaternion
-            // (not cross(forward, worldUp)) so panning stays well-defined
-            // even looking straight up/down, where that cross product would
-            // degenerate the same way the old lookAt reconstruction did.
-            float panScale = kPanSpeed * cam.distance; // fixed pixel drag -> fixed view fraction
-            cam.pivot -= cam.right() * static_cast<float>(deltaX) * panScale;
-            cam.pivot += cam.up() * static_cast<float>(deltaY) * panScale;
-        }
-
-        if (io.MouseWheel != 0.0f)
-        {
-            cam.distance = std::max(OrbitCamera::kMinDistance,
-                                    cam.distance * std::pow(kZoomStep, io.MouseWheel));
-        }
+        applyOrbitMouse(cam, static_cast<float>(deltaX), static_cast<float>(deltaY),
+                        leftOrbitAllowed && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS,
+                        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS,
+                        io.MouseWheel);
     }
 
     if (!io.WantCaptureKeyboard)

@@ -4,7 +4,7 @@
 // Sabercat Studio -- the editing application (docs/studio-design.md). S1 is the
 // shell: it owns the Vulkan instance and device (ownership model B, docs/library.md)
 // and lends them to the renderer; it edits a project's layers, saves and opens
-// .sabercat projects, and exports PLY and glTF.
+// .sabercat projects, and exports PLY, glTF and SPZ.
 //
 //   sabercat_studio.exe [project.sabercat | scene files...]
 //   sabercat_studio.exe --selftest <outDir> <scene>...     (headless, no window)
@@ -312,7 +312,7 @@ int main(int argc, char * argv[])
             const double now = glfwGetTime();
             const float deltaTime = static_cast<float>(now - lastFrameTime);
             lastFrameTime = now;
-            updateOrbitCamera(window, state.camera, deltaTime);
+            updateOrbitCamera(window, state.camera, deltaTime, ui.select.rectangleArmed);
             renderer.setCamera(state.camera.toCamera(renderer.width(), renderer.height()));
 
             drawStudioUi(state, renderer, ui);
@@ -356,6 +356,8 @@ int main(int argc, char * argv[])
     aboutLogo.destroy();
     ui.aboutLogo = 0;
     imgui.shutdown(renderer);
+    // The edit state's masks and history go before the clouds they point into.
+    state.edit.reset();
     state.project = Project{};
     renderer.shutdown();
     host.destroy();

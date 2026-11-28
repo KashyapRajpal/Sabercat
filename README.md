@@ -11,9 +11,10 @@ It ships as:
 - `Sabercat::sabercat`, a C++ library,
 - `Sabercat::sabercat_c`, a C ABI DLL,
 - `sabercat_viewer`, a scene viewer, and
-- `sabercat_studio`, a layer editor with project files and PLY / GLB export.
+- `sabercat_studio`, a layer editor with Gaussian selection, transform, delete, duplicate and undo, project files, and PLY / GLB / SPZ export, and
+- `sabercat_compare`, an image and scene comparer with PSNR, FLIP and HDR-FLIP metrics, in a window or on the command line.
 
-Sabercat 1.0.1 is the current release. Windows 10/11 (x64) with Visual Studio 2022 is the tested platform.
+Sabercat 1.1.0 is the current release. Windows 10/11 (x64) with Visual Studio 2022 is the tested platform.
 
 ![Sabercat feature reel](docs/media/sabercat-demo.gif)
 
@@ -25,23 +26,24 @@ Prebuilt packages are on the [Releases page](https://github.com/KashyapRajpal/Sa
 
 | Package | For |
 | --- | --- |
-| [sabercat-1.0.1-win64-apps.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.0.1/sabercat-1.0.1-win64-apps.zip) | Trying Sabercat: the Viewer and Studio, ready to run |
-| [sabercat-1.0.1-win64.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.0.1/sabercat-1.0.1-win64.zip) | Developers: the library, C ABI, headers and CMake package (see [docs/consuming.md](docs/consuming.md)) |
+| [sabercat-1.1.0-win64-apps.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.1.0/sabercat-1.1.0-win64-apps.zip) | Trying Sabercat: the Viewer, Studio and Compare, ready to run |
+| [sabercat-1.1.0-win64.zip](https://github.com/KashyapRajpal/Sabercat/releases/download/v1.1.0/sabercat-1.1.0-win64.zip) | Developers: the library, C ABI, headers and CMake package (see [docs/consuming.md](docs/consuming.md)) |
 
-You need Windows 10 or 11 (x64) and a GPU driver with Vulkan 1.3. Unzip the apps package and run `bin\Release\sabercat_viewer.exe` or `bin\Release\sabercat_studio.exe`. `README.txt` in the zip covers how to run the apps and where to report problems.
+You need Windows 10 or 11 (x64) and a GPU driver with Vulkan 1.3. Unzip the apps package and run `bin\Release\sabercat_viewer.exe`, `bin\Release\sabercat_studio.exe` or `bin\Release\sabercat_compare.exe`. `README.txt` in the zip covers how to run the apps and where to report problems.
 
 ## Features
 
 | Area | What is included |
 | --- | --- |
-| Rendering | Forward splat rendering on Vulkan compute, antialiasing, spherical harmonics up to the scene's degree, level-of-detail parameters, optional per-pixel depth output (depth, coverage, front depth) |
-| Training support | Backward pass that returns gradients for the Gaussian parameters (fp32 atomics), including gradients from a depth loss |
+| Rendering | Forward splat rendering on Vulkan compute, antialiasing, spherical harmonics up to the scene's degree, level-of-detail parameters, optional per-pixel depth output (depth, coverage, front depth), opt-in sort modes (stable, per-tile ray depth, per-pixel window, hybrid, stochastic transparency) measured in [docs/sorting-study.md](docs/sorting-study.md) |
+| Training support | Backward pass that returns gradients for the Gaussian parameters (fp32 atomics), including gradients from a depth loss, with a small trainer example (`examples/trainer_example`) that uses only the C ABI |
 | Lighting | Relighting with directional, point and rectangle lights and an environment light, ray-traced shadows (needs ray query), visibility bake |
 | Scene formats (read) | PLY, `.splat`, SPZ, `.ksplat`, SOG (`.sog` bundle or `meta.json`), glTF / GLB with `KHR_gaussian_splatting`, cloud-v1 directory |
-| Scene formats (write) | PLY, GLB (glTF with `KHR_gaussian_splatting`), cloud-v1 directory |
+| Scene formats (write) | PLY, GLB (glTF with `KHR_gaussian_splatting`), SPZ, cloud-v1 directory |
 | Projects | `.sabercat` project files with layers and layer transforms |
 | Integration | Owned or borrowed Vulkan device, stable C ABI with `struct_size` versioning, CMake package |
-| Applications | Viewer with orbit camera, drag and drop, and an ImGui debug panel; Studio with layers, inspector, project save / open, and export |
+| Applications | Viewer with orbit camera, drag and drop, and an ImGui debug panel; Studio with layers, inspector, editing of a layer's Gaussians with undo and redo, project save / open, and export; Compare for comparing two images or scenes side by side (see docs/compare.md) |
+| Tools | `sabercat_compare`: PSNR, FLIP and HDR-FLIP between two images (PNG, JPEG, WebP, EXR), with error maps ([docs/compare.md](docs/compare.md)). It also opens a window for comparing images (split, wipe, flicker, difference, probe, GPU PSNR/MSE, projects, exports). |
 
 ## Design highlights
 
@@ -58,7 +60,7 @@ The design decisions that shape the engine, with measured results. Timings are o
   - GLB export reloads untransformed layers bit for bit.
   - Layer transforms are restricted to translation, rotation and uniform scale. Under those, means, rotations, scales and spherical-harmonic bands transform without approximation.
   - Saves write a temporary file and rename it, so a failed save never corrupts a project.
-- **Verified with numbers, not screenshots.** Every kernel has a C++ reference. The forward pass matches it to a worst color error of 1.2e-7 and a depth error of 0. Gradients agree to within fp32-atomic rounding. The 30 GPU tests fail on any Vulkan validation message.
+- **Verified with numbers, not screenshots.** Every kernel has a C++ reference. The forward pass matches it to a worst color error of 1.2e-7 and a depth error of 0. Gradients agree to within fp32-atomic rounding. The 36 GPU tests fail on any Vulkan validation message.
 - **Long GPU work stays responsive.** The visibility bake sizes its submissions to a time budget, so a dense scene never trips the Windows GPU timeout. The batches never drop below a floor, since a smaller batch would only add submissions without finishing sooner.
 
 ## Requirements
@@ -87,7 +89,7 @@ Build options (all default to ON when Sabercat is the top-level project):
 
 | Option | Builds |
 | --- | --- |
-| `SABERCAT_BUILD_APPS` | `sabercat_viewer` and `sabercat_studio` |
+| `SABERCAT_BUILD_APPS` | `sabercat_viewer`, `sabercat_studio` and `sabercat_compare` |
 | `SABERCAT_BUILD_EXAMPLES` | The programs in `examples/` |
 | `SABERCAT_BUILD_TESTS` | The CTest tests |
 
@@ -111,6 +113,8 @@ You can also drag a scene file onto the window. Options:
 | `--borrowed` | Use a Vulkan device that the app creates and hands to the renderer |
 | `--validation` | Turn the Vulkan validation layer on in a Release build |
 | `--no-validation` | Turn the validation layer off, including in a Debug build |
+| `--log <path>` | Write the session log to this file instead of the default place |
+| `--no-log` | Write no session log file |
 | `--max-fps <n>` | Limit Viewer to this frame rate (default 240; 0 is unlimited) |
 | `--diagnostic-seconds <n>` | Log Viewer frame timings and exit after this many seconds of the render loop |
 
@@ -125,6 +129,14 @@ Paths given on the command line are loaded at start-up. Studio takes the same `-
 ```powershell
 build\apps\studio\Release\sabercat_studio.exe --selftest <outDir> [<scene>...]
 ```
+
+### 3. Compare two images
+
+```powershell
+build\apps\compare\Release\sabercat_compare.exe
+```
+
+Opens the comparer window. Drop two images or scenes in, or pass them on the command line. See [docs/compare.md](docs/compare.md).
 
 ## Library example
 
@@ -173,7 +185,7 @@ The prebuilt release zip and the `add_subdirectory` alternative are described in
 
 ## Tests
 
-The 30 GPU tests are the 29 `examples/*_test` programs plus `studio_selftest`. They are registered with CTest in `tests/integration`. They need a Vulkan 1.3 GPU, so run them on a local machine:
+The 36 GPU tests are the 34 example programs (`examples/*_test` and `examples/trainer_example`) plus `studio_selftest` and `compare_selftest`. They are registered with CTest in `tests/integration`. They need a Vulkan 1.3 GPU, so run them on a local machine:
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
@@ -181,19 +193,23 @@ ctest --test-dir build -C Release --output-on-failure
 
 A test fails when its output contains a `[validation]` line. Continuous integration builds the project but does not run these tests, because hosted runners have no GPU.
 
+The 5 CPU tests (label `cpu`) need no GPU: `command_buffer_test`, `unit_test`, `compare_flip_reference`, `test_cli_golden` and `test_cli_hdr`. Run them with `ctest --test-dir build -C Release -L cpu`. Continuous integration runs them.
+
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
 | [docs/building.md](docs/building.md) | Build options, dependencies, troubleshooting |
 | [docs/viewer.md](docs/viewer.md) | Viewer controls and flags |
-| [docs/studio.md](docs/studio.md) | Studio layers, project files, export |
+| [docs/studio.md](docs/studio.md) | Studio layers, editing, project files, export |
 | [docs/library.md](docs/library.md) | C++ API tour |
 | [docs/c-api.md](docs/c-api.md) | C ABI reference |
 | [docs/consuming.md](docs/consuming.md) | Using a release zip or the CMake package |
 | [docs/formats.md](docs/formats.md) | Scene, project, cloud-v1 and relight file formats; export details |
 | [docs/architecture.md](docs/architecture.md) | Module map, data layout, passes, synchronization |
 | [docs/shaders.md](docs/shaders.md) | Shader layout and the Slang build |
+| [docs/compare.md](docs/compare.md) | `sabercat_compare`: metrics, window and project files |
+| [docs/sorting-study.md](docs/sorting-study.md) | Sort-mode study: quality and cost of the alternatives to the default sort |
 | [docs/studio-design.md](docs/studio-design.md) | Studio design and plugin interface (proposed) |
 | [docs/releasing.md](docs/releasing.md) | Maintainer guide for releases |
 | [ROADMAP.md](ROADMAP.md) | Planned work |
@@ -207,7 +223,7 @@ A test fails when its output contains a `[validation]` line. Continuous integrat
 | `include/sabercat/` | Public headers (library and C ABI) |
 | `src/` | Library implementation |
 | `shaders/` | Slang shaders |
-| `apps/` | Viewer, Studio, and code they share |
+| `apps/` | Viewer, Studio, Compare, and code they share |
 | `examples/` | Example and test programs |
 | `tests/` | CTest registration |
 | `tools/` | Release, packaging and demo-reel scripts |

@@ -61,6 +61,11 @@ std::vector<FileFilter> glbFileFilters()
     return {{"glTF binary", "*.glb"}, {"All files", "*.*"}};
 }
 
+std::vector<FileFilter> spzFileFilters()
+{
+    return {{"Compressed splats", "*.spz"}, {"All files", "*.*"}};
+}
+
 std::vector<FilterSpec> buildFilterSpecs(const std::vector<FileFilter> & filters)
 {
     std::vector<FilterSpec> specs;

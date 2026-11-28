@@ -1,0 +1,88 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Shared helpers for the sorting study: the per-Gaussian ray-depth form and
+// its evaluation along a pixel ray.
+//
+// The form is camera-space and geometry-only, in whitened coordinates. With
+// P = S^-1 R^T W^T and u = P * mu_cam, the Gaussian's inverse covariance is
+// P^T P, so its density is a function of |P x - u|^2 and the peak along a ray
+// t * d is at
+//     t*(d) = dot(u, P d) / dot(P d, P d).
+// Ordering contributors by t*(d) instead of by their center depth is what the
+// exact and windowed reference orders compare against.
+//
+// Why whitened and not the inverse covariance B: the earlier 9-float form
+// stored B and a = B mu, and a = B mu cancels badly in fp32 (measured 2.8e-4
+// worst relative error). P and u are formed directly from the rotation and
+// the inverse scales, with no large terms subtracted, so the error stays at
+// the level of a few ulps.
+//
+// Per Gaussian the kernel stores the three columns of P (P e_x, P e_y, P e_z)
+// and u: 12 floats, read here with the stride SABERCAT_RAY_FORM_FLOATS.
+#ifndef SABERCAT_SORT_COMMON_SLANGH
+#define SABERCAT_SORT_COMMON_SLANGH
+
+#include "forward_common.slangh"
+
+// Floats per Gaussian in the ray-depth form buffer (ForwardPass::rayDepthForm).
+#define SABERCAT_RAY_FORM_FLOATS 12
+
+// Peak depth along the camera-space ray d = (dx, dy, -1) for the Gaussian whose
+// 12-float form starts at form[base]. Layout: [0..2] = P e_x, [3..5] = P e_y,
+// [6..8] = P e_z (the columns of P), [9..11] = u.
+//
+// With d' = P d = c0 dx + c1 dy - c2, t* = dot(u, d') / dot(d', d').
+// Returns fallbackDepth (the Gaussian's center depth) when dot(d', d') is not
+// positive or not finite, or when t* is not finite. A degenerate Gaussian has
+// an all-zero form, so its dot(d', d') is zero and it lands here too.
+float rayDepthAlongRay(StructuredBuffer<float> form, uint base, float fallbackDepth, float2 dxdy)
+{
+    float3 c0 = float3(form[base + 0], form[base + 1], form[base + 2]);
+    float3 c1 = float3(form[base + 3], form[base + 4], form[base + 5]);
+    float3 c2 = float3(form[base + 6], form[base + 7], form[base + 8]);
+    float3 u = float3(form[base + 9], form[base + 10], form[base + 11]);
+
+    float3 dp = c0 * dxdy.x + c1 * dxdy.y - c2;
+    float dd = dot(dp, dp);
+    // The isfinite check on dd matters: an infinite dd would give t = 0 for a
+    // finite numerator, which is wrong, not merely non-finite.
+    if (!(dd > 0.0f) || !isfinite(dd))
+    {
+        return fallbackDepth;
+    }
+    float t = dot(u, dp) / dd;
+    return isfinite(t) ? t : fallbackDepth;
+}
+
+// Stochastic transparency (Stochastic mode). The host side mirrors these three
+// helpers in src/renderer/blue_noise.cpp and examples/sort_study, so the CPU
+// model of the stochastic raster matches the GPU bit for bit.
+
+// lowbias32 integer hash, the same function as sabercat::stochasticHash on the
+// host. Hashes the Gaussian index into a per-candidate threshold offset.
+uint stochasticHash(uint x)
+{
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// A blue-noise rank (0..4095) as a threshold in [0, 1). Ranks are a permutation
+// of 0..4095, so the thresholds are evenly spread over the pixel's samples.
+float stochasticNoiseUnit(uint rank)
+{
+    return float(rank) * (1.0f / 4096.0f);
+}
+
+// fract(x) written out as x - floor(x), so the host model performs the same two
+// float operations in the same order instead of relying on a built-in.
+float fractf(float x)
+{
+    return x - floor(x);
+}
+
+#endif // SABERCAT_SORT_COMMON_SLANGH

@@ -10,6 +10,9 @@
 # with no window or ImGui, so the CPU unit tests link it too.
 add_library(sabercat_studio_core STATIC
     studio_state.cpp
+    studio_edit.cpp
+    studio_edits.cpp
+    edit_history.cpp
 )
 target_include_directories(sabercat_studio_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sabercat_studio_core PUBLIC sabercat_app_core)

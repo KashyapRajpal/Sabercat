@@ -4,6 +4,7 @@
 #include "studio_state.h"
 
 #include "app_util.h"
+#include "studio_edits.h"
 
 #include "sabercat/gaussian_cloud.h"
 #include "sabercat/gltf_writer.h"
@@ -11,6 +12,7 @@
 #include "sabercat/ply_writer.h"
 #include "sabercat/renderer.h"
 #include "sabercat/scene_loader.h"
+#include "sabercat/spz_writer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -19,8 +21,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <set>
 #include <stdexcept>
 
@@ -85,6 +89,17 @@ GaussianHostInput hostInputFor(const GaussianCloud & cloud)
         input.visibility = cloud.visibility().data();
     }
     return input;
+}
+
+// True when every component of the two transforms has the same bits. A drag that
+// returns a value to its start, or moves it by a bit, is a change; -0 and +0 differ.
+bool sameTransform(const LayerTransform & a, const LayerTransform & b)
+{
+    const float fa[8] = {a.rotation.w, a.rotation.x, a.rotation.y, a.rotation.z,
+                         a.translation.x, a.translation.y, a.translation.z, a.scale};
+    const float fb[8] = {b.rotation.w, b.rotation.x, b.rotation.y, b.rotation.z,
+                         b.translation.x, b.translation.y, b.translation.z, b.scale};
+    return std::memcmp(fa, fb, sizeof fa) == 0;
 }
 
 // --- App-state reads ------------------------------------------------------
@@ -280,10 +295,17 @@ void addLayerFromFile(StudioState & state, Device & device, const std::string & 
     layer.cloud = std::move(cloud);
     layer.id = nextLayerId(state.project);
     layer.name = utf8(fs::u8path(path).stem());
+    const int selectedBefore = state.selectedLayer;
     state.project.layers.push_back(std::move(layer));
-    state.selectedLayer = static_cast<int>(state.project.layers.size()) - 1;
+    const int index = static_cast<int>(state.project.layers.size()) - 1;
+    state.selectedLayer = index;
     state.dirty = true;
     state.sceneDirty = true;
+    if (!state.edit.replaying)
+    {
+        state.edit.history.push(std::make_unique<AddLayerCommand>(state, state.project.layers.back(), index,
+                                                                  selectedBefore, index));
+    }
     Logger::info("Studio: added layer " + state.project.layers.back().id + " from " + path);
 }
 
@@ -297,11 +319,28 @@ bool removeSelectedLayer(StudioState & state)
     {
         return false;
     }
-    state.project.layers.erase(state.project.layers.begin() + state.selectedLayer);
+    const int index = state.selectedLayer;
+    const std::string removedId = state.project.layers[index].id;
+    // A preview on this layer is restored before the layer leaves. Its data (the GPU copy)
+    // goes with the layer, and the removal's undo brings the layer back: it must hold the
+    // committed values, not the previewed ones.
+    if (state.edit.preview.active && state.edit.preview.layerId == removedId)
+    {
+        cancelTransformPreview(state);
+    }
+    // The edit state (the selection mask) moves into the command, so undo gets it back.
+    LayerEditNode node = state.edit.layers.extract(removedId);
+    ProjectLayer removed = std::move(state.project.layers[index]);
+    state.project.layers.erase(state.project.layers.begin() + index);
     const int remaining = static_cast<int>(state.project.layers.size());
-    state.selectedLayer = std::min(state.selectedLayer, remaining - 1);
+    state.selectedLayer = std::min(index, remaining - 1);
     state.dirty = true;
     state.sceneDirty = true;
+    if (!state.edit.replaying)
+    {
+        state.edit.history.push(std::make_unique<RemoveLayerCommand>(state, std::move(removed), std::move(node),
+                                                                      index, index, state.selectedLayer));
+    }
     return true;
 }
 
@@ -323,10 +362,16 @@ bool moveSelectedLayer(StudioState & state, int delta)
     {
         return false;
     }
+    const std::string movedId = state.project.layers[from].id;
     std::swap(state.project.layers[from], state.project.layers[to]);
     state.selectedLayer = to;
     state.dirty = true;
     state.sceneDirty = true;
+    // Edit state is keyed by id, so the swap leaves it as it is.
+    if (!state.edit.replaying)
+    {
+        state.edit.history.push(std::make_unique<MoveLayerCommand>(state, movedId, from, to, from, to));
+    }
     return true;
 }
 
@@ -354,9 +399,14 @@ bool setLayerVisible(StudioState & state, int index, bool visible)
     }
     if (layer->visible != visible)
     {
+        const bool before = layer->visible;
         layer->visible = visible;
         state.dirty = true;
         state.sceneDirty = true;
+        if (!state.edit.replaying)
+        {
+            state.edit.history.push(std::make_unique<LayerVisibilityCommand>(state, layer->id, before, visible));
+        }
     }
     return true;
 }
@@ -383,13 +433,24 @@ bool renameLayer(StudioState & state, int index, const std::string & name)
     {
         return false;
     }
-    layer->name = name;
-    state.dirty = true;
+    // Only a change is an edit: the rename popup applies its text whether or not it changed.
+    if (layer->name != name)
+    {
+        const std::string before = layer->name;
+        layer->name = name;
+        state.dirty = true;
+        if (!state.edit.replaying)
+        {
+            state.edit.history.push(std::make_unique<RenameLayerCommand>(state, layer->id, before, name));
+        }
+    }
     return true;
 }
 
 bool setLayerTransform(StudioState & state, int index, const LayerTransform & transform)
 {
+    // Not recorded: the Inspector calls this every frame of a drag. commitLayerTransformEdit()
+    // records the finished drag.
     ProjectLayer * layer = layerAt(state, index);
     if (layer == nullptr || layer->locked)
     {
@@ -398,6 +459,17 @@ bool setLayerTransform(StudioState & state, int index, const LayerTransform & tr
     layer->transform = transform;
     state.dirty = true;
     state.sceneDirty = true;
+    return true;
+}
+
+bool commitLayerTransformEdit(StudioState & state, int index, const LayerTransform & before)
+{
+    const ProjectLayer * layer = layerAt(state, index);
+    if (layer == nullptr || state.edit.replaying || sameTransform(layer->transform, before))
+    {
+        return false;
+    }
+    state.edit.history.push(std::make_unique<LayerTransformCommand>(state, layer->id, before, layer->transform));
     return true;
 }
 
@@ -420,25 +492,66 @@ void rebuildScene(StudioState & state, Renderer & renderer)
     state.sceneDirty = false;
     const auto start = std::chrono::steady_clock::now();
 
+    // The GPU merge reads each visible layer's GPU copy, so every visible layer is
+    // made GPU resident first.
+    for (ProjectLayer & layer : state.project.layers)
+    {
+        if (layer.visible && layer.cloud)
+        {
+            ensureLayerGpu(state, renderer, layer);
+        }
+    }
+
     const auto visible = visibleLayers(state);
     if (visible.empty())
     {
         // Nothing visible: an empty viewport. Also a no-op before any scene.
         renderer.clearScene();
+        state.edit.boundsExact = false;
     }
     else
     {
-        const std::shared_ptr<GaussianCloud> merged =
-            mergeLayers(renderer.sabercatDevice(), visible);
-        renderer.setGaussians(hostInputFor(*merged));
+        bool merged = false;
+        if (!state.edit.gpuMergeFailed)
+        {
+            try
+            {
+                renderer.mergeLayersOnGpu(visible);
+                merged = true;
+            }
+            catch (const std::exception & e)
+            {
+                // Once per session: gpuMergeFailed keeps later rebuilds on the host path.
+                state.edit.gpuMergeFailed = true;
+                Logger::warning(std::string("Studio: GPU layer merge failed (") + e.what()
+                                + "); using the host merge");
+            }
+        }
+        if (merged)
+        {
+            renderer.setSceneBounds(currentSceneBounds(state));
+        }
+        else
+        {
+            // The host merge reads the host vectors, so stale layers are synced first.
+            syncAllToHost(state);
+            const std::shared_ptr<GaussianCloud> host = mergeLayers(renderer.sabercatDevice(), visible);
+            renderer.setGaussians(hostInputFor(*host));
+            // The host path keeps the bounds setGaussians computed.
+            state.edit.boundsExact = false;
+        }
     }
 
     const auto end = std::chrono::steady_clock::now();
     state.lastRebuildMs = std::chrono::duration<double, std::milli>(end - start).count();
+    // A scene rebuild disables the renderer's highlight, so it is set again here.
+    refreshHighlight(state, renderer);
 }
 
 void newProject(StudioState & state)
 {
+    // Drops the masks and the history; the layers they belong to are replaced below.
+    state.edit.reset();
     state.project = Project{};
     state.projectPath.clear();
     state.selectedLayer = -1;
@@ -453,6 +566,10 @@ void newProject(StudioState & state)
 void openProject(StudioState & state, Renderer & renderer, const std::string & path)
 {
     Project loaded = ProjectIO::load(renderer.sabercatDevice(), path);
+    // The old layers are replaced: a preview on one of them is restored first, then
+    // every edit of the old project (its masks and history) is dropped.
+    cancelTransformPreview(state, renderer);
+    state.edit.reset();
     state.project = std::move(loaded);
     state.projectPath = path;
     state.selectedLayer = state.project.layers.empty() ? -1 : 0;
@@ -466,6 +583,9 @@ void openProject(StudioState & state, Renderer & renderer, const std::string & p
 
 void saveProject(StudioState & state, const std::string & path)
 {
+    // First: a file never holds previewed values. The preview is restored before the sync.
+    cancelTransformPreview(state);
+    syncAllToHost(state);
     state.project.appStateJson = buildAppStateJson(state);
     ProjectIO::save(state.project, path);
     state.projectPath = path;
@@ -473,20 +593,41 @@ void saveProject(StudioState & state, const std::string & path)
     Logger::info("Studio: saved " + path);
 }
 
-void exportPly(const StudioState & state, Device & device, const std::string & path)
+void exportPly(StudioState & state, Device & device, const std::string & path)
 {
+    // First: an export never holds previewed values (see saveProject).
+    cancelTransformPreview(state);
     const auto visible = visibleLayers(state);
     if (visible.empty())
     {
         throw std::runtime_error("No visible layers to export");
     }
+    // The layers' pointers and transforms stay valid across the sync.
+    syncAllToHost(state);
     const std::shared_ptr<GaussianCloud> merged = mergeLayers(device, visible);
     PLYWriter::write(*merged, path);
     Logger::info("Studio: exported PLY " + path);
 }
 
-void exportGlb(const StudioState & state, const std::string & path)
+void exportSpz(StudioState & state, Device & device, const std::string & path)
 {
+    // First: an export never holds previewed values (see saveProject).
+    cancelTransformPreview(state);
+    const auto visible = visibleLayers(state);
+    if (visible.empty())
+    {
+        throw std::runtime_error("No visible layers to export");
+    }
+    syncAllToHost(state);
+    const std::shared_ptr<GaussianCloud> merged = mergeLayers(device, visible);
+    SPZWriter::write(*merged, path);
+    Logger::info("Studio: exported SPZ " + path);
+}
+
+void exportGlb(StudioState & state, const std::string & path)
+{
+    // First: an export never holds previewed values (see saveProject).
+    cancelTransformPreview(state);
     std::vector<GLTFExportLayer> layers;
     for (const ProjectLayer & layer : state.project.layers)
     {
@@ -499,6 +640,7 @@ void exportGlb(const StudioState & state, const std::string & path)
     {
         throw std::runtime_error("No visible layers to export");
     }
+    syncAllToHost(state);
     GLTFWriter::writeGLB(layers, path);
     Logger::info("Studio: exported GLB " + path);
 }

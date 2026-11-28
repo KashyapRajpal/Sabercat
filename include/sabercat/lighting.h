@@ -167,10 +167,15 @@ struct ShadowFrameStats
 {
     uint64_t emitterSamplesDispatched = 0; // RayTraced: pixels x emitter samples dispatched (rays, upper bound)
     uint32_t accelerationBuilds = 0;       // acceleration-structure builds this frame
+    uint32_t accelerationRefits = 0;       // acceleration-structure refits this frame
+    // Refits applied to the shared structure since its last full build, after this
+    // frame (the structure rebuilds at 16).
+    uint32_t accelerationRefitsSinceBuild = 0;
     uint32_t reusedFrame = 0;              // 1 = the layers came from the frame cache
     uint32_t convergedLights = 0;          // progressive RayTraced: lights whose accumulation is complete
     uint32_t pendingLights = 0;            // ... still accumulating
 };
+static_assert(sizeof(ShadowFrameStats) == 32, "ShadowFrameStats is padding-free");
 
 // Renderer::bakeVisibility. Each Gaussian traces
 // `directions` rays from its mean (a fixed spherical Fibonacci set) through

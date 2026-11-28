@@ -1,0 +1,58 @@
+// Copyright 2026 Kashyap Rajpal
+// SPDX-License-Identifier: Apache-2.0
+
+// Selection (Studio phase C3): the parameter block of edit_select.slang, shared
+// with the host mirror SelectParamsHost in src/renderer/edit_pass.cpp, which must
+// match it byte for byte (256 bytes, checked there with static_assert).
+//
+// Every member is a 16-byte vector or matrix, or a run of 4-byte scalars at the
+// end, so the std430 layout has no implicit padding:
+// 64 + 64 + 48 + 16 + 16 + 16 + 16 + 16 = 256 bytes.
+
+#ifndef SABERCAT_EDIT_SELECT_COMMON_SLANGH
+#define SABERCAT_EDIT_SELECT_COMMON_SLANGH
+
+// SelectParams::shape.
+#define SABERCAT_SELECT_SHAPE_BOX 0u
+#define SABERCAT_SELECT_SHAPE_SPHERE 1u
+#define SABERCAT_SELECT_SHAPE_RECTANGLE 2u
+
+// SelectParams::op.
+#define SABERCAT_SELECT_OP_REPLACE 0u
+#define SABERCAT_SELECT_OP_ADD 1u
+#define SABERCAT_SELECT_OP_SUBTRACT 2u
+
+struct SelectParams
+{
+    // The layer's node matrix, column-vector convention: a layer-local mean p maps
+    // to world mul(layerToWorld, float4(p, 1)). The host uploads the fp32 rounding of
+    // the merge's BakeFrame matrix, identity for an identity placement.
+    float4x4 layerToWorld; // 64 B
+
+    // Rectangle only: CameraUniforms::worldToCamera of the view the rectangle was
+    // drawn in. Identity for the other shapes.
+    float4x4 worldToCamera; // 64 B
+
+    // Box only: the unit world-space axes of the box. xyz used, w unused.
+    float4 boxAxis[3]; // 48 B
+
+    // xyz: the box or sphere center in world space. w: the sphere radius.
+    float4 centerRadius; // 16 B
+
+    // xyz: the box half extents along boxAxis[0..2]. w unused.
+    float4 halfExtents; // 16 B
+
+    // Rectangle only: x0, y0, x1, y1 in framebuffer pixels, normalized (x0 <= x1,
+    // y0 <= y1), inclusive on all four sides.
+    float4 cameraRect; // 16 B
+
+    // Rectangle only: the camera intrinsics fx, fy, cx, cy of worldToCamera's view.
+    float4 intrinsics; // 16 B
+
+    uint shape;     // 4 B: SABERCAT_SELECT_SHAPE_*
+    uint op;        // 4 B: SABERCAT_SELECT_OP_*
+    uint count;     // 4 B: Gaussians in the layer
+    uint wordCount; // 4 B: mask words to write, ceil(count / 32)
+};
+
+#endif // SABERCAT_EDIT_SELECT_COMMON_SLANGH

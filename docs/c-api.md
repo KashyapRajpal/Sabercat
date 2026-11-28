@@ -287,6 +287,54 @@ of `dl_dimage`. The front-depth component is not differentiated.
   `SABERCAT_ERROR_UNSUPPORTED` without fp32 atomic add.
 - Gradients are overwritten, as in the color-only backward.
 
+### Training loop
+
+A training loop uses the C ABI for the renderer and its own compute kernels for
+the loss and the optimizer. `examples/trainer_example` is a complete, runnable
+loop (512 Gaussians, Adam, a synthetic scene). See
+[its README](../examples/trainer_example/README.md).
+
+Each step:
+
+1. Activate the raw parameters. Write the activated values into the parameter
+   views from `sabercat_renderer_get_gaussian_views()`: linear scale, opacity in
+   `[0, 1]`, normalized quaternion, and raw SH.
+2. `sabercat_renderer_set_camera()`, then `sabercat_renderer_forward()`.
+3. The loss kernel reads `sabercat_renderer_get_image_view()` and
+   `sabercat_renderer_get_depth_view()` on the compute queue. It writes dL/d(image)
+   and dL/d(depth) into its own buffers.
+4. `sabercat_renderer_backward_depth_view()` with those two buffers.
+5. The optimizer reads `sabercat_renderer_get_gradient_views()`. It converts the
+   gradients to raw parameters (table below) and updates its raw parameters.
+
+Synchronization:
+
+- Every Sabercat call is synchronous. It returns after its GPU work completes.
+- Sabercat and the caller share one queue, `compute_queue` in `SabercatDeviceInfo`.
+  Submit the caller's work that touches these buffers to that queue.
+- Each of the caller's command buffers starts and ends with a full memory
+  barrier (`VkMemoryBarrier`, all commands, read and write).
+- Do not wait on a fence around Sabercat calls.
+- Wait on a fence only when the host needs a result, for example before reading
+  it on the host.
+- The views stay valid while `sabercat_renderer_get_gaussian_storage()` reports
+  the same `generation`. Check it before each step.
+
+Chain rule from a gradient with respect to an activated value `g` to the raw
+parameter. `S` is the scale, `a` the opacity, and `q` the raw quaternion, with
+`qh = q / |q|`:
+
+| Raw parameter | Activation | Raw gradient |
+|---|---|---|
+| Log scale (xyz) | `S = exp(s)` | `g * S` |
+| Opacity logit | `a = 1 / (1 + exp(-o))` | `g * a * (1 - a)` |
+| Quaternion (xyzw) | `qh = q / \|q\|` | `(I - qh * qh^T) * g / \|q\|` |
+| Mean and SH | identity | `g` |
+
+The host path is a cross-check. Copy dL/d(image) and dL/d(depth) to host memory,
+call `sabercat_renderer_backward_depth()`, then `sabercat_renderer_read_gradients()`.
+It computes the same gradients as the device path, and the example compares the two.
+
 ### Lighting and shadows
 
 | Function | Purpose |

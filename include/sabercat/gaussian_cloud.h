@@ -42,6 +42,16 @@ constexpr int kShCoefficientsPerGaussian = static_cast<int>(kShCoefficients);
 // shaders encode the same strides implicitly by declaring
 // StructuredBuffer<float4>, so both sides must read one definition.
 
+// Which optional relight streams a GPU-only allocation carries (see
+// GaussianCloud::allocateGPU). The core streams are always allocated.
+struct RelightPresence
+{
+    bool normals = false;
+    bool baseColorRoughness = false;
+    bool metallic = false;
+    bool visibility = false;
+};
+
 // Struct-of-Arrays representation of a Gaussian cloud (PERFORMANCE.md
 // design rule 1): one contiguous array per attribute, both on the CPU
 // (parsed staging data) and the GPU (one Buffer per attribute).
@@ -195,6 +205,12 @@ class GaussianCloud
     {
         return m_bounds;
     }
+    // For a cloud with no host copy (GPU-edited or GPU-merged); the owner
+    // computes exact or conservative bounds.
+    void setBounds(const SceneBounds & bounds)
+    {
+        m_bounds = bounds;
+    }
 
     // Whether this scene was trained with the dilation opacity
     // compensation (mip-splatting / gsplat "antialiased"). A property of the
@@ -216,6 +232,14 @@ class GaussianCloud
     // handles, so storageGeneration() advances) and drops any gradient
     // buffers.
     void uploadToGPU(size_t capacity = 0);
+
+    // Allocates owned, UNINITIALIZED GPU storage for max(count, capacity)
+    // Gaussians with no host data. The host vectors are cleared and become stale
+    // until downloadFromGPU(). The core streams are always allocated; each relight
+    // stream only if its flag in `presence` is set. Recreates the buffers
+    // (storageGeneration() advances) and drops the gradient buffers. Bounds,
+    // shDegree and antialiased are left untouched. Requires count >= 1.
+    void allocateGPU(size_t count, size_t capacity, const RelightPresence & presence);
 
     // Resizable storage for densification -- std::vector semantics
     // over the GPU streams, never touching the host.
@@ -292,8 +316,9 @@ class GaussianCloud
     // for tests, debugging and the C API's host-copy path -- not a training
     // loop's hot path, which should bind the views instead.
     GaussianGradients downloadGradients() const;
-    // Refreshes the CPU-side vectors from the GPU buffers, picking up any
-    // on-GPU edits (e.g. an optimizer step through views()).
+    // Refreshes the CPU-side vectors from the GPU buffers: the core streams and
+    // every relight stream whose GPU stream exists. Picks up any on-GPU edits
+    // (e.g. an optimizer step through views()).
     void downloadFromGPU();
 
     // The OWNED buffers backing views(); null when the parameters are

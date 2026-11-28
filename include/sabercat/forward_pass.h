@@ -18,6 +18,7 @@
 #include "sabercat/image.h"
 #include "sabercat/pipeline.h"
 #include "sabercat/render_config.h"
+#include "sabercat/sort_settings.h"
 
 namespace sabercat
 {
@@ -148,6 +149,16 @@ struct ForwardRunRecord
 // once per growth, not per frame. ForwardPass submits on its own command
 // pool on Device::submitQueue() rather than via Device::immediateSubmit,
 // which is load-time-only, never the per-frame path.
+//
+// The non-default SortMode values add optional stages to that chain. Stable
+// runs a sticky-key update and a per-instance key rewrite before the radix
+// sort; TileRayDepth and Hybrid compute the ray-depth form and rewrite the
+// keys from it; PixelWindow computes the form and replaces tile_rasterize
+// with the per-pixel window rasterizer (Hybrid too, with K = 8). Stochastic
+// computes the form too, skips the depth-word radix passes (the order is
+// irrelevant to its coverage), rasterizes S jittered samples per pixel and
+// blends the result into a per-pixel history on the GPU. Each stage is built on
+// first use, and the default chain records none of them.
 class ForwardPass
 {
   public:
@@ -198,6 +209,88 @@ class ForwardPass
     // the per-frame path, and this call is exactly that: an occasional,
     // off-the-hot-path update, not a per-frame one.
     void setLODParams(const LODParams & params);
+
+    // Sort order for Viewer runs. Validates first (throws
+    // std::invalid_argument naming the field) and stores; no GPU work. Changing
+    // the Stochastic fields (samples, temporalFrames, temporalMode,
+    // temporalEmaWeight) or entering/leaving Stochastic restarts its temporal
+    // state, like resetStochastic(). Differentiable runs ignore the mode and use
+    // Default.
+    void setSortSettings(const SortSettings & settings);
+    const SortSettings & sortSettings() const
+    {
+        return m_sort;
+    }
+
+    // Opt-in GPU stage timing. Off by default, and while off run() records no
+    // extra commands. The first enable creates a timestamp query pool; a queue
+    // without timestamp support keeps lastStageTimings() invalid.
+    void setStageTimingEnabled(bool enabled);
+    bool stageTimingEnabled() const
+    {
+        return m_timingEnabled;
+    }
+    // Stage times of the most recent run(). Valid only when that run was
+    // stamped: timing on, stopAfter == Rasterize, and no capacity re-run.
+    const ForwardStageTimings & lastStageTimings() const
+    {
+        return m_lastTimings;
+    }
+
+    // Verification and study use. Computes the whitened ray-depth form (12
+    // floats per Gaussian, 48 bytes; layout in shaders/sort_common.slangh) for views.gaussianCount
+    // Gaussians in a standalone submission: its own vkResetCommandPool and
+    // submitAndWait, no timestamps, and nothing run() recorded is touched.
+    // camera.gaussianCount must equal views.gaussianCount (VK_VALIDATE). The
+    // kernel is built on first use.
+    void computeRayDepthForm(const CanonicalGaussianBufferViews & views,
+                             const CameraUniforms & camera);
+    // The form computed by the last computeRayDepthForm(), or by the last run()
+    // in TileRayDepth, PixelWindow, Hybrid or Stochastic mode (which computes it
+    // for its camera every frame). Throws std::runtime_error if neither ever ran.
+    const Buffer & rayDepthForm() const;
+
+    // Stable mode's sticky bucket keys: one uint per Gaussian, the key each
+    // Gaussian was last sorted with. Persists across runs. Throws
+    // std::runtime_error if no Stable run has happened.
+    const Buffer & stableKeys() const;
+    // Starts the sticky keys over: the next Stable run refills them with
+    // 0xFFFFFFFF (the "no key yet" sentinel) before its first dispatch.
+    void resetStableSort();
+    // Stochastic mode's temporal state. resetStochastic() restarts the noise
+    // sequence (frame 0) and the accumulation: the next Stochastic run is a raw
+    // frame. The last* accessors describe the most recent completed Stochastic
+    // run; lastStochasticAccumulated() is the count after that run, and reads 1
+    // right after a reset.
+    void resetStochastic();
+    uint32_t lastStochasticFrame() const
+    {
+        return m_stochLastFrame;
+    }
+    uint32_t lastStochasticAccumulated() const
+    {
+        return m_stochAccumulated;
+    }
+    float lastStochasticWeight() const
+    {
+        return m_stochLastWeight;
+    }
+    // Bytes of the mode-specific buffers (sticky keys, ray-depth form, and the
+    // Stochastic noise, params and history). They are grow-only or sized with the
+    // framebuffer, so this is their allocated size, not the live count.
+    uint64_t extraBufferBytes() const;
+    // Selection highlight. While set, every Viewer run() moves the color of each
+    // Gaussian whose bit is set in maskWords toward tint[0..2] (display-referred
+    // sRGB) by tint[3], right after projection (shaders/highlight_tint.slang).
+    // maskWords is one bit per Gaussian, word w covering Gaussians [32w, 32w + 32),
+    // and must hold at least ceil(gaussianCount / 32) words at each run(); it is
+    // read at every run, so a view that moves (a reallocated buffer) is fine as long
+    // as setHighlight() is called again with the new view. Differentiable runs never
+    // tint. Throws on an invalid view. The tint is recorded only by the runs that
+    // use it, so with no highlight set the run's commands are exactly the default.
+    void setHighlight(const BufferView & maskWords, const float tint[4]);
+    // Turns the highlight off; the next run() records no tint.
+    void clearHighlight();
 
     const Image & outputImage() const
     {
@@ -304,6 +397,54 @@ class ForwardPass
         std::unique_ptr<Buffer> values;
     };
 
+    // A compute stage built on first use instead of in createPipelines(), so
+    // the default path never creates it. Each stage owns its descriptor
+    // set, like the fixed stages below. Members of this type are built by
+    // ensureOptionalStage() and torn down by destroyOptionalStage() in release().
+    struct OptionalStage
+    {
+        explicit OptionalStage(VkDevice device) : descriptors(device) {}
+
+        DescriptorSet descriptors;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        Pipeline pipeline;
+        bool built = false;
+    };
+
+    // Builds `stage` from shaderDir's `kernelName`.comp.spv the first time it
+    // is called, with one descriptor set of `bindings` and `pushConstantSize`
+    // bytes of push constants. Does nothing once built.
+    OptionalStage & ensureOptionalStage(OptionalStage & stage, const char * kernelName,
+                                        const std::vector<VkDescriptorSetLayoutBinding> & bindings,
+                                        uint32_t pushConstantSize);
+    // Destroys the pipeline of a stage that ensureOptionalStage() built.
+    void destroyOptionalStage(OptionalStage & stage);
+    // Checks that `mode` is a SortMode value (an internal guard: the settings
+    // were validated when they were set). Every mode can run.
+    void requireSortModeAvailable(SortMode mode) const;
+    // Builds the stages the run's mode needs and grows the buffers they use
+    // (sticky keys, ray-depth form, the Stochastic noise and params). Called by
+    // run() before anything is recorded; does nothing in Default mode.
+    void ensureSortModeResources(uint32_t gaussianCount);
+    // Binds every descriptor set the run's mode uses to the current buffers.
+    // Descriptor writes must happen outside command recording, so run() calls
+    // this before its submission and again after a capacity growth.
+    void bindSortModeDescriptors();
+    // Grows m_rayForm to gaussianCount * 12 floats and builds m_rayFormStage.
+    void ensureRayForm(uint32_t gaussianCount);
+    // Binds the ray-form stage's descriptors to `views` and m_rayForm. Outside
+    // command recording, like bindSortModeDescriptors().
+    void bindRayFormDescriptors(const CanonicalGaussianBufferViews & views);
+    // Records the ray-form dispatch for `camera` (groups from
+    // camera.gaussianCount). Its descriptors must already be bound.
+    void recordRayFormDispatch(CommandBuffer & cmd, const CameraUniforms & camera);
+    // Writes timestamp `index` into the stage-timing pool, but only when the
+    // current run is stamping (m_stampThisRun). Otherwise does nothing.
+    void stamp(VkCommandBuffer cmd, uint32_t index);
+    // Converts the timestamps of the run that just finished into m_lastTimings.
+    void readStageTimings();
+
     // Shared by downloadOutputImage()/downloadDepthImage(): transitions
     // `image` GENERAL -> TRANSFER_SRC_OPTIMAL, copies `byteSize` bytes into
     // `dst`, submits and waits on ForwardPass's own command pool.
@@ -318,6 +459,8 @@ class ForwardPass
     void ensureInstanceCapacity(uint32_t instanceCount);
     void ensureScanCapacity(VkDeviceSize elementCount);
     void rebindDynamicDescriptors();
+    // Builds the highlight kernel and its descriptor set on the first tinted run.
+    void ensureHighlightPipeline();
 
     // Records `record` between the two Device::recordGlobalBarrier calls of
     // the queue contract, submits it to Device::submitQueue() and waits.
@@ -368,6 +511,22 @@ class ForwardPass
     DepthLayout m_depthLayout = DepthLayout::None;
     std::unique_ptr<Buffer> m_depthBuffer; // width*height*n floats, see depthBuffer()
     ForwardRunRecord m_lastRun;
+    // The views of the run in progress. The ray-form stage binds them, and
+    // the chain's form dispatch re-records from them after a capacity re-run.
+    CanonicalGaussianBufferViews m_runViews{};
+
+    // -- Sort settings and stage timing. Grouped by size (pointers, then
+    // 4-byte fields, then bools) so the layout carries no interior padding. --
+    std::string m_shaderDir; // kept so OptionalStage builds can load kernels
+    VkQueryPool m_timingPool = VK_NULL_HANDLE; // kTimestampCount stamps, created on first enable
+    SortSettings m_sort;
+    ForwardStageTimings m_lastTimings;
+    uint32_t m_timestampValidBits = 0; // of the submit queue; 0 = no timestamps
+    SortMode m_runSortMode = SortMode::Default; // effective mode of the run in progress
+    uint32_t m_runWindow = 0;     // window size K of the run in progress (8, 16 or 32)
+    uint32_t m_stickyGaussianCount = 0; // gaussianCount the sticky keys were built for
+    bool m_timingEnabled = false;
+    bool m_stampThisRun = false; // this run() writes timestamps (see run())
 
     // Persistent host-visible readback target for the instance total
     // (created directly via VMA, not through Buffer -- Buffer's allocations
@@ -431,6 +590,63 @@ class ForwardPass
     VkDescriptorSetLayout m_rasterizeLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_rasterizeSet = VK_NULL_HANDLE;
     Pipeline m_rasterizePipeline;
+
+    // -- Ray-depth form (computeRayDepthForm, and the chain in TileRayDepth,
+    // PixelWindow and Hybrid). Built on first use, so the default path never
+    // creates it. m_rayForm is grow-only. --
+    OptionalStage m_rayFormStage;
+    std::unique_ptr<Buffer> m_rayForm; // gaussianCount * 12 floats, see rayDepthForm()
+    bool m_rayFormComputed = false;
+
+    // -- Sort-variant stages, built on first use by ensureSortModeResources().
+    // m_windowStage is indexed by windowStageIndex() (K = 8, 16, 32). --
+    OptionalStage m_stableUpdateStage;
+    OptionalStage m_stableKeysStage;
+    OptionalStage m_tileRayKeysStage;
+    OptionalStage m_windowStage[3];
+    // Stable's sticky bucket keys, one uint per Gaussian (4 B each). Persists
+    // across runs and is grow-only. Reset (refilled with the sentinel at the
+    // start of the next Stable submission) when m_stickyReset is set. Set on
+    // creation, resetStableSort(), resize(), a gaussianCount change, and a
+    // change of the Stable parameters or of entering/leaving Stable.
+    std::unique_ptr<Buffer> m_sticky;
+    bool m_stickyReset = false;
+
+    // -- Stochastic transparency. The stages and the noise and params buffers are
+    // built on the first Stochastic run. The history is sized to the framebuffer:
+    // resize() drops it, and the next Stochastic run recreates it. --
+    OptionalStage m_stochRasterStage[2]; // tile_rasterize_stochastic_s4 / _s8 (index S == 8)
+    OptionalStage m_stochResolveStage;   // stochastic_resolve
+    std::unique_ptr<Buffer> m_stochNoise;   // 4096 uints: blue-noise ranks, uploaded once
+    std::unique_ptr<Buffer> m_stochParams;  // 16 B: the frame offset of the current run
+    std::unique_ptr<Buffer> m_stochHistory; // width*height float4; null until a Stochastic run
+    // The camera of the last completed run, for the "camera moved" test.
+    CameraUniforms m_stochPrevCamera{};
+    // The noise frame and accumulation of the run in progress, computed before
+    // anything is recorded and committed only when its submission succeeds.
+    struct StochasticStep
+    {
+        uint32_t frame;
+        uint32_t accumulated;
+        float weight;
+    };
+    StochasticStep m_runStochastic{0, 1, 1.0f};
+    uint32_t m_stochFrame = 0;         // noise frame index of the next run
+    uint32_t m_stochAccumulated = 1;   // frames blended into the history
+    uint32_t m_stochGaussianCount = 0; // gaussianCount of the last completed run
+    uint32_t m_stochLastFrame = 0;     // frame index the last completed run used
+    float m_stochLastWeight = 1.0f;    // history weight the last completed run used
+    bool m_stochPrevValid = false;     // m_stochPrevCamera holds a completed run's camera
+    bool m_stochReset = true;          // the next Stochastic run starts over
+    // -- Selection highlight (see setHighlight). The kernel is built lazily, on the
+    // first tinted run, so a ForwardPass that never highlights never loads it. --
+    DescriptorSet m_highlightDescriptors;
+    VkDescriptorSetLayout m_highlightLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_highlightSet = VK_NULL_HANDLE; // bindings: 0 projected, 1 mask
+    Pipeline m_highlightPipeline;
+    BufferView m_highlightMask;
+    float m_highlightTint[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool m_highlightEnabled = false;
 };
 
 } // namespace sabercat

@@ -2,10 +2,11 @@ Sabercat @SABERCAT_VERSION@
 =============
 
 Sabercat is a renderer and editor for Gaussian splat scenes (3D scenes made of
-many soft, semi-transparent points). The package has two apps:
+many soft, semi-transparent points). The package has three apps:
 
   sabercat_viewer.exe   open a scene, orbit around it, relight it
   sabercat_studio.exe   layers, an inspector, project save and open, export
+  sabercat_compare.exe  compare two images or scenes (PSNR, FLIP), window or command line
 
 REQUIREMENTS
 ------------
@@ -18,8 +19,8 @@ REQUIREMENTS
 HOW TO RUN
 ----------
   1. Unzip the archive anywhere you like.
-  2. Open the bin\Release folder and double-click sabercat_viewer.exe or
-     sabercat_studio.exe.
+  2. Open the bin\Release folder and double-click sabercat_viewer.exe,
+     sabercat_studio.exe or sabercat_compare.exe.
   3. Drag a scene file onto the window to open it.
 
 SCENE FORMATS

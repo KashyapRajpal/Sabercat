@@ -1,10 +1,14 @@
 # Sabercat Studio: design
 
 **Status:** S1 is implemented and ships in 1.0.0. S1 is the application shell,
-project files and export (section 5). Milestones S2 to S5 are design only, and
-ROADMAP.md lists them. The parts that S1 reuses are the renderer, the relight
-and shadow passes, the loaders and the borrowed-device model. See
-[docs/library.md](library.md) for the device contract.
+project files and export (section 5). S2 ships in 1.1.0 in part: the GPU layer
+merge, box, sphere and rectangle selection with a highlight, transform of the
+selection (rigid and uniform scale), delete, duplicate, undo and redo, and the
+History window. The rest of S2 is later work, and the deviations from this plan are listed in
+section 1.4. Milestones S3 to S5 are design only, and ROADMAP.md lists them.
+The parts that S1 reuses are the renderer, the relight and shadow passes, the
+loaders and the borrowed-device model. See [docs/library.md](library.md) for
+the device contract.
 
 **Goal.** One artist tool: drop in a photo or a capture, get interactive
 Gaussian splats, then relight, edit and export them, without leaving the app.
@@ -99,53 +103,120 @@ a planned item.
 Every operation is a compute kernel over the layer's buffers, so a selection
 of millions of Gaussians stays interactive.
 
+The status of each item is S2 as built in 1.1.0. Items marked *not built* are
+later work. The deviations from this plan are D1 to D8, after the list.
+
 - **Selection** is a per-Gaussian bit buffer: one `uint` per 32 Gaussians, on
-  the GPU.
+  the GPU (`SelectionMask`).
   - Screen tools: rectangle, lasso, and a brush with depth-aware pick. They
-    test each Gaussian's projected center, and optionally its 2D extent. They
-    reuse the forward pass's projected Gaussians, so no second projection is
-    needed.
-  - Volume tools: box and sphere in world space.
-  - Similarity growth: color or normal within a tolerance of a seed.
-  - Selection operations (add, subtract, invert, grow) are bitwise kernels.
-  - A highlight debug view tints selected Gaussians.
-- **Transform** applies an affine matrix M to the selection. The mean becomes
-  M·μ. The covariance becomes A·Σ·Aᵀ, where A is the linear part of M. It is
-  factored back into rotation and scale by a 3×3 symmetric eigen
-  decomposition. The factoring is exact for rigid transforms and uniform
-  scale. The general case keeps an exact covariance. SH bands 1 to 3 rotate
-  with the rotation part of A, using a per-band Wigner rotation (see
-  `src/renderer/sh_rotation.cpp`). Interaction uses a gizmo with a live
-  preview. The preview is the same kernel applied to a scratch copy, and is
-  committed on release.
-- **Delete** sets a tombstone (opacity 0, which the forward pass already
-  skips below 1/255) for instant feedback. A compaction kernel (prefix sum
-  and scatter, reusing `prefix_sum.slang`) runs on commit, save or export. It
-  emits the index remap for the plugin's optimizer state.
-- **Duplicate** appends the selection into spare capacity (`reserveGaussians`,
-  grow-only storage) and selects the copies, so the gizmo can move them at
-  once.
+    test each Gaussian's projected center, and optionally its 2D extent. The
+    rectangle is built. It projects the Gaussians itself, not the forward
+    pass's projected buffer (D3). The lasso and the brush are *not built*.
+  - Volume tools: box and sphere in world space. Built.
+  - Similarity growth: color or normal within a tolerance of a seed. *Not built.*
+  - Selection operations are bitwise kernels. Add, subtract and invert are
+    built. Grow is *not built*.
+  - A highlight tints selected Gaussians in the unlit image (D6). It is not a
+    debug view. The outline around the selection is *not built*.
+- **Transform** of the selection. Built for rigid transforms and uniform scale
+  about a pivot, computed in double and applied in fp32 with the layer merge's
+  math (`layerSpaceEdit`). The general affine transform M, the covariance
+  update and the eigen factoring are *not built*. The design's plan for them is
+  kept below for later work: the mean becomes M·μ, the covariance becomes
+  A·Σ·Aᵀ, where A is the linear part of M, and the covariance is factored back
+  into rotation and scale. SH bands 1 to 3 rotate with the rotation part, using
+  a per-band rotation (see `src/renderer/sh_rotation.cpp`). Interaction is
+  numeric fields with a live preview in the Transform window, not a gizmo (*not
+  built*). The preview applies the transform to the layer's own buffers and
+  keeps a sparse copy of the touched values to restore them, instead of a
+  scratch copy. Apply commits it as one undo step.
+- **Delete** compacts at once (D2). The tombstone stage (opacity 0) is not
+  built. One compaction pass flags the kept Gaussians, scans the flags and
+  gathers every stream (`edit_compact.slang`, with the prefix sum from
+  `GpuScan`). The index remap for the plugin's optimizer state is an optional
+  output of `EditPass::deleteSelected`. Studio does not request it in 1.1,
+  since there is no optimizer state to remap before S3.
+- **Duplicate** appends copies of the selection after the layer's last
+  Gaussian and selects the copies, so the Transform window can move them at
+  once. The layer grows with the library's reserve call, to max(needed, 1.5
+  times the capacity), when the spare capacity runs out.
 - **Material painting** is a brush that writes `baseColorRoughness` and
   `metallic` (and optionally normals) for the Gaussians under it. Falloff is
   radial, weighted by each Gaussian's screen coverage. The brush creates the
-  relight streams on first use if the layer lacks them.
-- **Acceleration structure and cache.** Edit kernels run inside the renderer,
-  so the renderer records each one as a scene edit. The acceleration
-  structure and cached shadows then stay valid with no call from the app.
-  Transforms and paint refit the structure; delete compaction and duplicate
-  rebuild it. Writes from outside the renderer go through `gaussianViews()`,
-  and the app calls `markSceneChanged()` after each batch. Until that mode
-  exists, such writes disable reuse, as they do today.
-- **Undo** uses the command pattern. Each command stores what it needs to
-  invert itself:
-  - transforms store a sparse snapshot of the touched Gaussians' prior values,
-    not the matrix. Inverting the matrix in fp32 is not bit-exact;
-  - delete and duplicate store the index ranges and the remap;
-  - paint and destructive operations store a sparse snapshot of the touched
-    Gaussians' prior values, read back from the GPU for the selected indices
-    only.
-  - History has a memory budget (default 1 GB of host memory). The oldest
-    entries are dropped first, with a warning.
+  relight streams on first use if the layer lacks them. *Not built* (S5).
+- **Acceleration structure and cache.** The edit kernels run on each layer's
+  own buffers. Only `Renderer::mergeLayersOnGpu()` writes the renderer's scene,
+  and the renderer records that merge as a scene edit. The acceleration
+  structure and cached shadows then stay valid with no call from the app (D1).
+  Writes from outside the renderer still go through `gaussianViews()`, and the
+  app calls `markSceneChanged()` after each batch, as before.
+- **Undo** uses the command pattern (`EditCommand`, `EditHistory`). Each
+  command stores what it needs to invert itself:
+  - selection changes store the mask words before and after the change, one
+    bit per Gaussian. Undo uploads the words before, and redo the words after;
+  - transforms store a sparse snapshot of the selected Gaussians' prior values
+    (indices, means, scales, rotations, SH and normals), not the matrix.
+    Inverting the matrix in fp32 is not bit-exact. Undo scatters the snapshot
+    back word for word. Redo applies the same layer-space similarity to the
+    same selection;
+  - delete stores a `DeleteRecord`: a full sparse snapshot of the deleted
+    Gaussians, the selection words, and the old and kept counts. Undo puts the
+    Gaussians back in their order. Redo restores the selection and runs the
+    same compaction again on the restored input (D4), so no post-edit state is
+    stored;
+  - duplicate stores the selection from before the copy and the old count.
+    Undo drops the appended Gaussians and restores that selection;
+  - layer-list and layer-property changes (add, remove, move, rename,
+    visibility) hold the layer, or its old value, while it is out of the
+    project. A removed layer keeps its selection mask, so undo brings it back
+    with its selection (D8);
+  - Inspector transform edits of a layer: one step per finished drag of its
+    Translation, Rotation or Scale fields, and one for Reset transform (D8);
+  - the history has a memory budget of 1 GiB of host memory (`bytes()` counts
+    what each command holds). The oldest entry is dropped first, with a warning
+    in the session log. A new edit after an undo discards the steps that were
+    undone. Locks are not recorded.
+
+**Deviations in 1.1.0.** The S2 build differs from the plan above as follows.
+
+- **D1. Edit kernels and the scene.** The kernels run in the library's
+  `EditPass` on each layer's own GPU buffers. Only `Renderer::mergeLayersOnGpu()`
+  writes the renderer's scene, and the renderer records the merge as a scene
+  edit, so the acceleration structure and cached shadows stay valid without
+  `gaussianViews()`. A merge that keeps the Gaussian count and the layout
+  refits the acceleration structure, and it does so up to 16 times in a row
+  (`refitsSinceBuild`); after that it rebuilds. The plan had the transform and
+  paint kernels refit and the delete and duplicate kernels rebuild. In 1.1 the
+  merge decides, so an edit is applied on the next scene rebuild.
+- **D2. Delete compacts at once.** There is no tombstone stage and no commit
+  step: Delete compacts the layer when it runs.
+- **D3. Rectangle selection.** It projects each layer's Gaussian centers with
+  the camera of the last completed forward (`Renderer::lastForwardCamera()`),
+  and selects through all depths. It does not reuse the forward's projected
+  buffer. A frame must have been drawn first.
+- **D4. Redo.** Redo re-runs the deterministic kernel on the input restored bit
+  for bit. No post-edit snapshot is kept.
+- **D5. Active layer only.** Selection and editing apply to the active layer,
+  which must be visible and unlocked. Selections across layers are not built.
+- **D6. Highlight.** The highlight is a tint dispatch after projection
+  (`highlight_tint.slang`), not a debug view. It applies to the viewer forward
+  only and shows in the unlit image (`readImage()`, `present()`, and the Final
+  debug view). It does not show in the lit image.
+- **D7. Bounds.** After a GPU merge the renderer holds no host copy, so the app
+  supplies the scene bounds (`Renderer::setSceneBounds()`). Studio passes the
+  exact `mergedLayerBounds()` when no visible layer is stale and no drag is in
+  progress. Otherwise it passes a conservative box: each layer's local bounds,
+  mapped by its placement.
+- **D8. History scope.** The history also covers selection changes, layer
+  operations (add, remove, move, rename, visibility) and Inspector transform
+  edits of a layer (one step per finished drag, and Reset transform), not only
+  Gaussian edits. Lock toggles are not in it.
+
+Not built in 1.1, besides the items marked above: the general affine transform
+and gizmo, the lasso, polygon and brush selection, the outline, similarity
+growth, and material painting. The History window of section 3 is built: it is
+in the Window menu, and it lists the steps, jumps to any of them, and shows the
+memory use against the budget.
 
 ### 1.5 Export
 
@@ -220,10 +291,12 @@ and shadow windows carry over.
 | Train | Dataset, iterations, time-slice budget, loss curve, pause and resume |
 | Light | The relight window: lights, environment, shadow mode, baked visibility |
 | Paint | Brush size, falloff, channel (base color, roughness, metallic, normal) |
-| History | The undo stack, with click to jump |
+| History | The undo stack, with click to jump. Built in 1.1 (Window menu): every step with its size, applied and undone steps, a jump to any step, the memory use against the budget, Undo, Redo and Clear history |
 
 Viewport modes: **View**, **Select** (with tool sub-modes), **Transform** and
-**Paint**, with conventional hotkeys (Q, W, E, R and B).
+**Paint**, with conventional hotkeys (Q, W, E, R and B). *Not built in 1.1.* The
+Select and Transform tools are windows opened from the Window menu, and Q and E
+roll the camera.
 
 ## 4. Project file format
 
@@ -258,7 +331,7 @@ thumbnails/project.png  preview image
   `layers/<id>/relight/` sidecar, with optional `normals`,
   `base_color_roughness`, `metallic` and `visibility` entries. The cloud-v1
   directory itself is unchanged. A reader may ignore the sidecar.
-- Undo history is not saved. Selections are not saved by default.
+- Undo history is not saved. Selections are not saved.
 - Saving writes a temporary file and renames it over the old one, so a crash
   during a save does not corrupt the project.
 
@@ -270,7 +343,7 @@ Each milestone ships through the release flow in
 | Milestone | Scope | Done when |
 |---|---|---|
 | S1 | Shell: device owner, layers, project save and load, PLY and glTF export | **Shipped in 1.0.0.** Project save and load is bit-exact (`project_test`). PLY and glTF round trips through the Sabercat readers are measured (`ply_writer_test`, `gltf_writer_test`). Not yet checked in a third-party viewer |
-| S2 | Editing: selection tools, transform, delete, duplicate, undo; GPU layer merge | Every operation matches a CPU reference on a synthetic cloud. Undo restores the buffers bit-exactly |
+| S2 | Editing: selection tools, transform, delete, duplicate, undo; GPU layer merge | **Part shipped in 1.1.0** (see section 1.4 for the status and deviations D1 to D8). Shipped: the GPU layer merge, box, sphere and rectangle selection with the highlight, rigid and uniform-scale transform of the selection, delete, duplicate, and undo and redo with the Edit menu. Not in 1.1: lasso, polygon and brush selection, the outline, the gizmo, the general affine transform and similarity growth. Done when: every operation matches a CPU reference on a synthetic cloud, and undo restores the buffers bit-exactly. `sabercat_edit_test` compares the kernels with host references, and the Studio self-test compares the GPU merge with the host merge |
 | S3 | Trainer plugin: time-sliced training and refine to photo; index remap after edits | A capture trains inside Studio while staying interactive. Editing mid-training keeps the optimizer consistent |
 | S4 | Generation: interface, sidecar backend, then the ONNX Runtime backend | One image becomes splats inside Studio. Both backends render the same result within a stated tolerance |
 | S5 | Material painting and relight export (the vendor glTF extension and R3DG-style PLY) | A painted, relit scene exports and reloads with identical streams |
@@ -292,9 +365,10 @@ Nothing is signed off from screenshots alone.
 - **Layer rendering:** one merged cloud with per-layer ranges (one sort, one
   forward pass), or per-layer passes composited. Per-layer passes are simpler,
   but wrong where layers interpenetrate. The merged form is the lean choice.
-  S1 uses a host merge (`mergeLayers`, applied to the visible layers) to build
-  the scene. A GPU merge, which applies layer transforms by kernel into the
-  merged buffers, comes with S2.
+  S1 used a host merge (`mergeLayers`, applied to the visible layers) to build
+  the scene. S2 (1.1.0) merges on the GPU (`Renderer::mergeLayersOnGpu()`),
+  applying each layer's transform by kernel into the merged buffers. The host
+  merge remains for the PLY and SPZ exports and as the fallback.
 
 ## 8. Plugin interface (proposed)
 

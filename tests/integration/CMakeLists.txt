@@ -16,6 +16,7 @@ set(_sabercat_integration_tests
     c_api_test
     cloud_v1_reader_test
     compute_test
+    debug_view_test
     depth_gradient_test
     depth_output_test
     device_test
@@ -36,10 +37,14 @@ set(_sabercat_integration_tests
     sh_lod_test
     shadow_test
     sog_reader_test
+    sort_modes_test
     splat_reader_test
     spz_reader_test
+    spz_writer_test
+    trainer_example
     visibility_test
     zip_archive_test
+    edit_test
 )
 
 # A listed program with no target is a configure error when the examples are
@@ -60,6 +65,11 @@ foreach(_sabercat_t IN LISTS _sabercat_integration_tests)
     endif()
 endforeach()
 
+# The trainer example runs in well under 180 s on a Debug build, so a 300 s limit is enough.
+if(TARGET sabercat_trainer_example)
+    set_tests_properties(trainer_example PROPERTIES TIMEOUT 300)
+endif()
+
 # The Studio's headless self-test with no scene files: a synthetic two-layer
 # project, its PLY checked against mergeLayers, and export refused with nothing
 # visible. Needs the apps; the output directory is per configuration.
@@ -68,5 +78,16 @@ if(TARGET sabercat_studio)
         COMMAND $<TARGET_FILE:sabercat_studio> --selftest
                 ${CMAKE_BINARY_DIR}/tests/studio_selftest-$<CONFIG>)
     set_tests_properties(studio_selftest PROPERTIES LABELS gpu TIMEOUT 900
+        FAIL_REGULAR_EXPRESSION "\\[validation\\]")
+endif()
+
+# The compare window's headless self-test: the GPU metric and compositor against the CPU
+# reference, the device copies, and the PNG and report exports. Needs the compare app;
+# the output directory is per configuration.
+if(TARGET sabercat_compare)
+    add_test(NAME compare_selftest
+        COMMAND $<TARGET_FILE:sabercat_compare> --selftest
+                ${CMAKE_BINARY_DIR}/tests/compare_selftest-$<CONFIG>)
+    set_tests_properties(compare_selftest PROPERTIES LABELS gpu TIMEOUT 900
         FAIL_REGULAR_EXPRESSION "\\[validation\\]")
 endif()

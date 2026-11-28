@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 # C is enabled only for examples/c_api_test, which must compile as genuine C
 # to prove the C ABI header (c_api.h) is C-clean.
-project(Sabercat VERSION 1.0.1 LANGUAGES C CXX)
+project(Sabercat VERSION 1.1.0 LANGUAGES C CXX)
 
 # Pre-release suffix for the version string (cmake -DSABERCAT_VERSION_SUFFIX=beta.1).
 # Validated as semver pre-release identifiers. The CMake package version stays
@@ -275,6 +275,7 @@ add_library(sabercat
     src/renderer/ply_writer.cpp
     src/renderer/splat_reader.cpp
     src/renderer/spz_reader.cpp
+    src/renderer/spz_writer.cpp
     src/renderer/gltf_reader.cpp
     src/renderer/gltf_writer.cpp
     src/renderer/layer_transform.cpp
@@ -287,7 +288,13 @@ add_library(sabercat
     src/renderer/zip_archive.cpp
     src/renderer/scene_loader.cpp
     src/renderer/forward_pass.cpp
+    src/renderer/blue_noise.cpp
     src/renderer/backward_pass.cpp
+    src/renderer/gpu_scan.cpp
+    src/renderer/edit_pass.cpp
+    src/renderer/edit_math.cpp
+    src/renderer/selection_mask.cpp
+    src/renderer/highlight_pass.cpp
     src/renderer/gaussian_acceleration_structure.cpp
     src/renderer/debug_visualizer.cpp
     src/utils/logger.cpp
@@ -414,6 +421,7 @@ if(TARGET zlib)
     set(_sabercat_dll_consumers
         sabercat_viewer
         sabercat_studio
+        sabercat_compare
         sabercat_triangle
         sabercat_hello_sabercat
         sabercat_device_test
@@ -422,6 +430,7 @@ if(TARGET zlib)
         sabercat_splat_reader_test
         sabercat_ply_writer_test
         sabercat_spz_reader_test
+        sabercat_spz_writer_test
         sabercat_gltf_reader_test
         sabercat_gltf_writer_test
         sabercat_cloud_v1_reader_test
@@ -437,6 +446,7 @@ if(TARGET zlib)
         sabercat_image_view_test
         sabercat_depth_gradient_test
         sabercat_depth_output_test
+        sabercat_debug_view_test
         sabercat_borrowed_test
         sabercat_relight_test
         sabercat_shadow_test
@@ -446,7 +456,11 @@ if(TARGET zlib)
         sabercat_project_test
         sabercat_scene_diag
         sabercat_renderer_test
-        sabercat_scene_loader_test)
+        sabercat_scene_loader_test
+        sabercat_sort_modes_test
+        sabercat_sort_study
+        sabercat_trainer_example
+        sabercat_edit_test)
 
     set(_sabercat_copy_commands)
     foreach(_sabercat_exe IN LISTS _sabercat_dll_consumers)

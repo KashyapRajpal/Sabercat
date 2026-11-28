@@ -38,6 +38,20 @@ set(SABERCAT_SHADER_SOURCES
     visibility_splat.slang
     visibility_debug.slang
     shadow_upsample.slang
+    # sorting study
+    ray_depth_form.slang
+    sort_stable_update.slang
+    sort_stable_keys.slang
+    sort_tile_ray_keys.slang
+    stochastic_resolve.slang
+    # Studio edit kernels
+    layer_merge.slang
+    edit_select.slang
+    edit_mask_ops.slang
+    edit_compact.slang
+    edit_transform.slang
+    selection_merge.slang
+    highlight_tint.slang
 )
 
 # The shared headers -- a change to any must invalidate every kernel that
@@ -49,6 +63,9 @@ set(SABERCAT_SHADER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/color_space.slangh
     ${CMAKE_CURRENT_SOURCE_DIR}/gaussian_ray.slangh
     ${CMAKE_CURRENT_SOURCE_DIR}/light_visibility.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/sort_common.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/edit_common.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/edit_select_common.slangh
 )
 
 # Extra slangc flags for any kernel that TRACES rays (calls
@@ -105,6 +122,43 @@ foreach(shader ${SABERCAT_RAY_QUERY_SHADER_SOURCES})
     )
     list(APPEND SABERCAT_SHADER_SPV_FILES ${shaderSpv})
 endforeach()
+
+# Sort-study variants: one .slang compiled again with preprocessor defines, so a
+# variant needs no copy of the source. Usage:
+#   sabercat_add_shader_variant(<name> <source.slang> <DEFINE=VALUE> ...)
+# Writes ${CMAKE_CURRENT_BINARY_DIR}/<name>.comp.spv, the same file name shape
+# as the kernels above, and adds it to SABERCAT_SHADER_SPV_FILES. This is a
+# macro rather than a function because that list append must reach the caller's
+# scope. The window rasterizer and the stochastic rasterizer variants are both declared below.
+macro(sabercat_add_shader_variant variantName variantSource)
+    set(variantDefines)
+    foreach(variantDefine ${ARGN})
+        list(APPEND variantDefines -D${variantDefine})
+    endforeach()
+    set(variantSrc ${CMAKE_CURRENT_SOURCE_DIR}/${variantSource})
+    set(variantSpv ${CMAKE_CURRENT_BINARY_DIR}/${variantName}.comp.spv)
+
+    add_custom_command(
+        OUTPUT ${variantSpv}
+        COMMAND ${SLANGC} ${variantSrc} -target spirv -fvk-use-entrypoint-name -stage compute
+                -entry main -I ${CMAKE_CURRENT_SOURCE_DIR} ${variantDefines} -o ${variantSpv}
+        DEPENDS ${variantSrc} ${SABERCAT_SHADER_HEADERS}
+        COMMENT "Compiling ${variantSource} as ${variantName} (Slang -> SPIR-V, variant)"
+        VERBATIM
+    )
+    list(APPEND SABERCAT_SHADER_SPV_FILES ${variantSpv})
+endmacro()
+
+# Window-resort rasterizer, one variant per window size K (the per-pixel window of
+# the WindowRayDepth model; K = 8 is Hybrid, 16 and 32 are PixelWindow).
+sabercat_add_shader_variant(tile_rasterize_window_k8 tile_rasterize_window.slang SABERCAT_SORT_WINDOW=8)
+sabercat_add_shader_variant(tile_rasterize_window_k16 tile_rasterize_window.slang SABERCAT_SORT_WINDOW=16)
+sabercat_add_shader_variant(tile_rasterize_window_k32 tile_rasterize_window.slang SABERCAT_SORT_WINDOW=32)
+
+# Stochastic-transparency rasterizer, one variant per samples-per-pixel count S
+# (the Stochastic mode's ST4 and ST8).
+sabercat_add_shader_variant(tile_rasterize_stochastic_s4 tile_rasterize_stochastic.slang SABERCAT_ST_SAMPLES=4)
+sabercat_add_shader_variant(tile_rasterize_stochastic_s8 tile_rasterize_stochastic.slang SABERCAT_ST_SAMPLES=8)
 
 add_custom_target(sabercat_shaders DEPENDS ${SABERCAT_SHADER_SPV_FILES})
 

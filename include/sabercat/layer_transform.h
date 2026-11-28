@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "sabercat/scene_bounds.h"
+
 namespace sabercat
 {
 
@@ -49,5 +51,17 @@ std::shared_ptr<GaussianCloud> transformedCopy(Device & device, const GaussianCl
 // if all layers are. Throws on an empty list.
 std::shared_ptr<GaussianCloud> mergeLayers(
     Device & device, const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers);
+
+// The bounds mergeLayers() would give its result, computed without building it: each
+// layer's host positions() go through the same per-Gaussian transform the bake applies
+// (identity: copied; otherwise the double node matrix times the float position, cast to
+// float, w = 0), into one transient array, then the same reduction as
+// GaussianCloud::computeBounds(). Positions only; GPU state is not read, so the result
+// equals the host bake of the same layers. Throws std::runtime_error for a null layer,
+// an invalid transform, or a layer whose host positions() are not sized to its count()
+// (a GPU-only cloud must be synced first: GaussianCloud::downloadFromGPU()). An empty
+// list gives SceneBounds{}.
+SceneBounds mergedLayerBounds(
+    const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers);
 
 } // namespace sabercat

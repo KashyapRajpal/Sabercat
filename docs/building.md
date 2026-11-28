@@ -1,6 +1,6 @@
 # Building Sabercat
 
-This guide covers building the library, the two applications and the tests
+This guide covers building the library, the applications and the tests
 from source on Windows. For using the built library in your own project, see
 [consuming.md](consuming.md).
 
@@ -71,14 +71,16 @@ them:
 | VMA 3.2.1 | The Vulkan SDK if it ships VMA, otherwise fetched (pinned) | Library |
 | spz | Submodule `external/spz` | Library (`.spz` reader) |
 | zlib 1.3.1 | Fetched (pinned by SHA-256) | Library (`.spz`, `.sog`) |
-| libwebp 1.6.0 | Fetched (pinned by SHA-256) | Library (`.sog`) |
+| libwebp 1.6.0 | Fetched (pinned by SHA-256) | Library (`.sog`), sabercat_compare (`.webp` input) |
 | nlohmann/json 3.12.0 | Fetched (pinned by SHA-256) | Library (glTF, `.sog`, project files) |
+| NVlabs FLIP (pinned commit d3ab02a) | Fetched (pinned by SHA-256) | sabercat_compare |
+| tinyexr 3.4.0 (with its bundled miniz) | Fetched (pinned by SHA-256) | sabercat_compare (`.exr` input) |
 
 ### CMake options
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `SABERCAT_BUILD_APPS` | `ON` when Sabercat is the top-level project | Builds `sabercat_viewer` and `sabercat_studio`. |
+| `SABERCAT_BUILD_APPS` | `ON` when Sabercat is the top-level project | Builds `sabercat_viewer`, `sabercat_studio` and `sabercat_compare`. |
 | `SABERCAT_BUILD_EXAMPLES` | `ON` when Sabercat is the top-level project | Builds the programs in `examples/`, including the `*_test` programs. |
 | `SABERCAT_BUILD_TESTS` | `ON` when Sabercat is the top-level project | Builds the tests and registers them with CTest. |
 | `SABERCAT_FETCH_HEADER_DEPS` | `OFF` | Fetches the pinned GLM and VMA even when an installed package (GLM) or the Vulkan SDK provides them. Use it for reproducible builds. |
@@ -102,9 +104,13 @@ Build outputs go to the default Visual Studio folders. For example:
 |---------|------|
 | Viewer | `build\apps\viewer\Release\sabercat_viewer.exe` |
 | Studio | `build\apps\studio\Release\sabercat_studio.exe` |
+| Compare | `build\apps\compare\Release\sabercat_compare.exe` |
 
 The build copies `zlib` next to every executable that needs it, so the
 programs run from their build folder without extra steps.
+
+The compiled compare shaders come from the `sabercat_compare_shaders` target,
+which `sabercat_compare` depends on.
 
 You can also open the folder in Visual Studio (File, Open, CMake). Or open
 the generated `build\Sabercat.sln`.
@@ -121,7 +127,7 @@ The install tree has this layout:
 |-----------------------|----------|
 | `include\sabercat\` | Public headers, including `version.h` and `shaders\config.slangh` |
 | `lib\<Config>\` | `sabercat.lib`, `sabercat_c.lib`, and the vendored libraries |
-| `bin\<Config>\` | `sabercat_c.dll`, `sabercat_viewer.exe`, `sabercat_studio.exe`, `zlib` DLL |
+| `bin\<Config>\` | `sabercat_c.dll`, `sabercat_viewer.exe`, `sabercat_studio.exe`, `sabercat_compare.exe`, `zlib` DLL |
 | `share\sabercat\shaders\` | Compiled shaders (`*.spv`) |
 | `lib\cmake\Sabercat\` | CMake package files |
 
@@ -156,7 +162,7 @@ The Vulkan validation layer (`VK_LAYER_KHRONOS_validation`) is set like this:
 
 If the layer is not installed, the app logs a warning and runs without it.
 Install the layer from the Vulkan SDK to use it. The flags are accepted by
-`sabercat_viewer` and `sabercat_studio`.
+`sabercat_viewer`, `sabercat_studio` and `sabercat_compare` (window only).
 
 ## Tests
 

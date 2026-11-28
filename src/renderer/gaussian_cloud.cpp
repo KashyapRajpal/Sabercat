@@ -6,6 +6,7 @@
 #include "sabercat/buffer.h"
 #include "sabercat/device.h"
 #include "sabercat/vk_check.h"
+#include "scene_bounds_compute.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,21 +50,21 @@ void GaussianCloud::initialize(size_t count)
     m_times.resize(count, 0.0f);
 }
 
-void GaussianCloud::computeBounds()
+SceneBounds computeSceneBounds(const glm::vec4 * positions, size_t count)
 {
-    m_bounds = SceneBounds{};
-    if (m_count == 0 || m_positions.empty())
+    SceneBounds bounds;
+    if (count == 0 || positions == nullptr)
     {
-        return; // leaves valid == false
+        return bounds;
     }
 
     glm::vec3 lo(std::numeric_limits<float>::max());
     glm::vec3 hi(std::numeric_limits<float>::lowest());
     bool sawFinite = false;
 
-    for (size_t i = 0; i < m_count; ++i)
+    for (size_t i = 0; i < count; ++i)
     {
-        const glm::vec3 p(m_positions[i]);
+        const glm::vec3 p(positions[i]);
         // Skip non-finite positions rather than letting one NaN poison the
         // whole result -- a single bad Gaussian would otherwise make every
         // comparison false and leave the bounds at their sentinel values,
@@ -79,26 +80,26 @@ void GaussianCloud::computeBounds()
 
     if (!sawFinite)
     {
-        return;
+        return bounds;
     }
 
-    m_bounds.min = lo;
-    m_bounds.max = hi;
-    m_bounds.valid = true;
+    bounds.min = lo;
+    bounds.max = hi;
+    bounds.valid = true;
 
     // Robust framing volume: median center, 90th-percentile radius. Both use
     // std::nth_element (O(n), no full sort) so this stays cheap even at a
     // million Gaussians. See SceneBounds for why the AABB alone is not a usable
     // framing target.
     std::vector<float> component;
-    component.reserve(m_count);
+    component.reserve(count);
     glm::vec3 medianCenter(0.0f);
     for (int axis = 0; axis < 3; ++axis)
     {
         component.clear();
-        for (size_t i = 0; i < m_count; ++i)
+        for (size_t i = 0; i < count; ++i)
         {
-            const float v = m_positions[i][axis];
+            const float v = positions[i][axis];
             if (std::isfinite(v))
             {
                 component.push_back(v);
@@ -106,7 +107,7 @@ void GaussianCloud::computeBounds()
         }
         if (component.empty())
         {
-            return;
+            return bounds;
         }
         const size_t mid = component.size() / 2;
         std::nth_element(component.begin(), component.begin() + mid, component.end());
@@ -114,10 +115,10 @@ void GaussianCloud::computeBounds()
     }
 
     std::vector<float> distances;
-    distances.reserve(m_count);
-    for (size_t i = 0; i < m_count; ++i)
+    distances.reserve(count);
+    for (size_t i = 0; i < count; ++i)
     {
-        const glm::vec3 p(m_positions[i]);
+        const glm::vec3 p(positions[i]);
         if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
         {
             distances.push_back(glm::length(p - medianCenter));
@@ -125,7 +126,7 @@ void GaussianCloud::computeBounds()
     }
     if (distances.empty())
     {
-        return;
+        return bounds;
     }
 
     const size_t percentileIndex =
@@ -133,16 +134,29 @@ void GaussianCloud::computeBounds()
     std::nth_element(
         distances.begin(), distances.begin() + percentileIndex, distances.end());
 
-    m_bounds.focusCenter = medianCenter;
-    m_bounds.focusRadius = distances[percentileIndex];
+    bounds.focusCenter = medianCenter;
+    bounds.focusRadius = distances[percentileIndex];
 
     // A scene can legitimately have >90% of its Gaussians at one point (a
     // degenerate or single-object capture); fall back to the full radius rather
     // than handing the viewer a zero-radius target it would divide by.
-    if (!(m_bounds.focusRadius > 0.0f))
+    if (!(bounds.focusRadius > 0.0f))
     {
-        m_bounds.focusRadius = m_bounds.radius();
+        bounds.focusRadius = bounds.radius();
     }
+
+    return bounds;
+}
+
+void GaussianCloud::computeBounds()
+{
+    m_bounds = SceneBounds{};
+    if (m_count == 0 || m_positions.empty())
+    {
+        return; // leaves valid == false
+    }
+
+    m_bounds = computeSceneBounds(m_positions.data(), m_count);
 }
 
 void GaussianCloud::uploadToGPU(size_t capacity)
@@ -198,6 +212,57 @@ void GaussianCloud::uploadToGPU(size_t capacity)
                    "metallic");
     optionalStream(m_visibilityBuffer, m_visibility.size(), kVisibilityCoefficients,
                    kVisibilityCoefficients * kVisibilityStride, m_visibility.data(), "visibility");
+    bindOwnedParameters();
+    m_borrowedParameters = false;
+
+    // Reallocated on the next backward()/gradientViews().
+    dropGradients();
+    ++m_storageGeneration;
+}
+
+void GaussianCloud::allocateGPU(size_t count, size_t capacity, const RelightPresence & presence)
+{
+    VK_VALIDATE(count > 0, "GaussianCloud::allocateGPU called with no Gaussians");
+
+    // No host copy: every host vector is cleared, so downloadFromGPU() is the
+    // way back to the CPU.
+    m_positions.clear();
+    m_scales.clear();
+    m_rotations.clear();
+    m_shCoefficients.clear();
+    m_opacities.clear();
+    m_times.clear();
+    m_normals.clear();
+    m_baseColorRoughness.clear();
+    m_metallic.clear();
+    m_visibility.clear();
+
+    m_count = count;
+    m_capacity = std::max(count, capacity);
+    const VkDeviceSize cap = static_cast<VkDeviceSize>(m_capacity);
+    m_positionBuffer = std::make_unique<Buffer>(m_device, cap * kMeansStride);
+    m_scaleBuffer = std::make_unique<Buffer>(m_device, cap * kScalesStride);
+    m_rotationBuffer = std::make_unique<Buffer>(m_device, cap * kRotationsStride);
+    m_colorBuffer =
+        std::make_unique<Buffer>(m_device, cap * kShCoefficientsPerGaussian * kShStride);
+    m_opacityBuffer = std::make_unique<Buffer>(m_device, cap * kOpacityStride);
+
+    // Each relightable stream is allocated if present, dropped otherwise.
+    const auto optionalStream = [&](std::unique_ptr<Buffer> & target, bool present,
+                                    VkDeviceSize bytesPerGaussian)
+    {
+        target.reset();
+        if (present)
+        {
+            target = std::make_unique<Buffer>(m_device, cap * bytesPerGaussian);
+        }
+    };
+    optionalStream(m_normalBuffer, presence.normals, kNormalsStride);
+    optionalStream(m_baseColorRoughnessBuffer, presence.baseColorRoughness,
+                   kBaseColorRoughnessStride);
+    optionalStream(m_metallicBuffer, presence.metallic, kMetallicStride);
+    optionalStream(m_visibilityBuffer, presence.visibility,
+                   kVisibilityCoefficients * kVisibilityStride);
     bindOwnedParameters();
     m_borrowedParameters = false;
 
@@ -454,6 +519,26 @@ void GaussianCloud::downloadFromGPU()
                  m_shCoefficients.size() * sizeof(glm::vec4));
     downloadView(m_device, m_parameters.opacity, m_opacities.data(),
                  m_opacities.size() * sizeof(float));
+    // Every other relight stream that exists on the GPU is refreshed too; an
+    // absent one leaves its host vector empty.
+    if (m_relight.normals.valid())
+    {
+        m_normals.resize(m_count);
+        downloadView(m_device, m_relight.normals, m_normals.data(),
+                     m_normals.size() * sizeof(glm::vec4));
+    }
+    if (m_relight.baseColorRoughness.valid())
+    {
+        m_baseColorRoughness.resize(m_count);
+        downloadView(m_device, m_relight.baseColorRoughness, m_baseColorRoughness.data(),
+                     m_baseColorRoughness.size() * sizeof(glm::vec4));
+    }
+    if (m_relight.metallic.valid())
+    {
+        m_metallic.resize(m_count);
+        downloadView(m_device, m_relight.metallic, m_metallic.data(),
+                     m_metallic.size() * sizeof(float));
+    }
     // A baked visibility stream lives only on the GPU until here.
     if (m_relight.visibility.valid())
     {

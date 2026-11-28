@@ -20,12 +20,14 @@ toolchain.
 - [Scenes](#scenes)
 - [Camera and image size](#camera-and-image-size)
 - [Forward and backward](#forward-and-backward)
+- [Sort modes](#sort-modes)
 - [Relighting](#relighting)
 - [Shadows](#shadows)
 - [Baked visibility and teacher samples](#baked-visibility-and-teacher-samples)
 - [Loaders and writers](#loaders-and-writers)
 - [Projects](#projects)
 - [Layer transforms](#layer-transforms)
+- [GPU layer merge and edits](#gpu-layer-merge-and-edits)
 - [Borrowed buffers](#borrowed-buffers)
 - [Ownership and synchronization](#ownership-and-synchronization)
 - [Presenting to a window](#presenting-to-a-window)
@@ -36,19 +38,25 @@ toolchain.
 | Header | Contents |
 |---|---|
 | `sabercat/renderer.h` | `Renderer`, `GaussianHostInput`, `GaussianHostOutput`, `RenderMode`, `DebugView` |
+| `sabercat/sort_settings.h` | `SortMode`, `SortSettings`, `ForwardStageTimings`, `validateSortSettings()`, `sortModeName()`, `sortModeIncompatibleWithLighting()` |
+| `sabercat/forward_pass.h` | `ForwardPass` and its stage types. Advanced: see [ForwardPass (advanced)](#forwardpass-advanced). |
 | `sabercat/device.h` | `Device`, `VulkanContext`, `EnabledDeviceFeatures`, `DeviceRequirements`, `DeviceFeatures` |
 | `sabercat/borrowed.h` | `BorrowedGaussians`, `validateBorrowedGaussians()` |
 | `sabercat/camera.h` | `Camera` |
 | `sabercat/scene_bounds.h` | `SceneBounds` |
 | `sabercat/lighting.h` | `Light`, `EnvironmentLight`, `LightingSettings`, `ShadowSettings`, `VisibilityBakeSettings`, `TeacherSettings` |
 | `sabercat/buffer_view.h` | `BufferView`, `CanonicalGaussianBufferViews`, `RelightBufferViews`, `CanonicalGaussianGradientViews` |
-| `sabercat/gaussian_cloud.h` | `GaussianCloud`, `GaussianGradients` |
+| `sabercat/gaussian_cloud.h` | `GaussianCloud`, `GaussianGradients`, `RelightPresence` |
 | `sabercat/render_config.h` | Stride and limit constants (`kMaxLights`, `kVisibilityCoefficients`, ...) |
 | `sabercat/scene_loader.h` | `loadScene()`, `detectFormat()`, `SceneFormat` |
 | `sabercat/project.h` | `Project`, `ProjectLayer`, `ProjectIO` |
-| `sabercat/layer_transform.h` | `LayerTransform`, `transformedCopy()`, `mergeLayers()` |
+| `sabercat/layer_transform.h` | `LayerTransform`, `transformedCopy()`, `mergeLayers()`, `mergedLayerBounds()` |
+| `sabercat/edit_pass.h` | `EditPass`, `MergeLayer`, `MergedLayout`, `planLayerMerge()`, `SelectShape`, `SelectOp`, `SelectionQuery`, `MaskCentroid`, `SnapshotScope`, `SparseSnapshot`, `DeleteRecord`, `DuplicateRecord` |
+| `sabercat/selection_mask.h` | `SelectionMask` |
+| `sabercat/edit_math.h` | `Similarity`, `layerSpaceEdit()`, and the GPU-free predicates |
+| `sabercat/highlight_settings.h` | `HighlightSettings` |
 | `sabercat/ply_reader.h`, `gltf_reader.h`, `splat_reader.h`, `spz_reader.h`, `sog_reader.h`, `ksplat_reader.h`, `cloud_v1_reader.h` | Readers, one class per format |
-| `sabercat/ply_writer.h`, `gltf_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `CloudV1Writer`, `RelightSidecar` |
+| `sabercat/ply_writer.h`, `gltf_writer.h`, `spz_writer.h`, `cloud_v1_writer.h` | `PLYWriter`, `GLTFWriter`, `SPZWriter`, `CloudV1Writer`, `RelightSidecar` |
 | `sabercat/c_api.h` | The C ABI. See [c-api.md](c-api.md). |
 
 ## Renderer lifecycle
@@ -183,8 +191,9 @@ Owned GPU buffers are freed. A borrowed scene's buffers stay yours. Afterwards:
 - `gaussianCount()` is 0 and `sceneBounds().valid` is false.
 - `storageGeneration()` has advanced.
 - `forward()` is a no-op.
-- `readImage()`, `imageView()`, `readDepth()`, `depthView()`, `readLitImage()`
-  and `backward()` throw until a `forward()` of a new scene.
+- `readImage()`, `imageView()`, `readDepth()`, `depthView()`, `readLitImage()`,
+  `renderDebugView()`, `readDebugView()` and `backward()` throw until a
+  `forward()` of a new scene.
 - `present()` shows the clear color.
 
 The camera, lights and other settings are kept. A scene set afterwards
@@ -283,6 +292,7 @@ renderer.backward(lossGradientView);                   // sabercat::BufferView
 | `backward(const BufferView &, const BufferView &)` | As above, with dL/d(depth) from a device buffer |
 | `imageView()` | The last differentiable forward's image as a device buffer |
 | `readDepth()`, `depthView()` | The last differentiable forward's depth output, as a host copy or a device buffer |
+| `renderDebugView()`, `readDebugView()` | A debug view (alpha, depth, tile density, SH degree, or the final color) of the last forward, as a device buffer or a host copy. See [Debug views](#debug-views). |
 | `readGradients()` | Host copy as `GaussianGradients` |
 | `gaussianViews()`, `gradientViews()` | Device views of the parameter and gradient streams |
 
@@ -362,6 +372,45 @@ renderer.backward(dLdImage.data(), dLdDepth.data());
 - Throws if a depth gradient is given and the layout is `DepthLayout::None`.
 - Gradients are overwritten, as with the color-only backward.
 
+### Debug views
+
+The viewer's debug views are available headless. `renderDebugView()` runs one
+of them over the last `forward()` and returns a device buffer. `readDebugView()`
+returns the same image as a host copy. Either works after a `Viewer` or a
+`Differentiable` forward.
+
+```cpp
+renderer.forward(sabercat::RenderMode::Viewer);
+std::vector<float> density = renderer.readDebugView(sabercat::DebugView::TileDensity);
+sabercat::DebugViewScales scales;
+scales.depth = 10.0f;
+std::vector<float> depth = renderer.readDebugView(sabercat::DebugView::Depth, scales);
+```
+
+| `DebugView` | Shows | Scale |
+|---|---|---|
+| `Final` | The forward color image, the `readImage()` values (not the lit image) | None |
+| `Alpha` | Coverage, as grayscale | None |
+| `Depth` | Front depth, as grayscale | `scales.depth`, default 50 |
+| `TileDensity` | Instances per tile, from blue (empty) to red (dense) | `scales.density`, default 64 |
+| `SHDegree` | Effective SH degree per pixel, from blue (0) through green and yellow to red (3), scaled by coverage | None |
+
+- The output is `width * height` RGBA floats, row-major, stride 16 bytes. It
+  is display-referred and is what `present()` shows for that view with the
+  same scales. Alpha is 1 except in `Final`.
+- `Depth` does not need a depth layout. `DebugViewScales` holds the two
+  display scales, and both must be positive.
+- The calls do not re-run `forward()` and write nothing that `forward()` or
+  `backward()` reads. They may be called any number of times, and after
+  `present()`.
+- They throw before any `forward()`, after a scene change, `clearScene()` or
+  a resize, until the next `forward()`, and with a scale that is not positive.
+- One buffer is reused. It is allocated on the first call, so an application
+  that never calls these allocates nothing. Its handle is stable across calls
+  and changes only on a resize. Its contents are valid until the next
+  `renderDebugView()` or `readDebugView()` call, the next resize, or
+  `shutdown()`. Like every call, they are synchronous.
+
 ### Densification
 
 Parameter buffers can grow. The renderer treats them like `std::vector`:
@@ -375,6 +424,119 @@ Parameter buffers can grow. The renderer treats them like `std::vector`:
 A trainer writes new Gaussians into `[oldCount, newCount)` through
 `gaussianViews()`, then raises the count. Gaussians in that range are
 whatever the trainer wrote.
+
+## Sort modes
+
+The forward pass blends each tile's Gaussians in a sort order. The default
+order is the one the renderer has always used. Five other modes are opt-in:
+`Stable`, `TileRayDepth`, `PixelWindow`, `Hybrid` and `Stochastic`. The
+architecture of each is in [architecture.md](architecture.md#sort-modes).
+
+Set the mode with `SortSettings` (`sabercat/sort_settings.h`):
+
+| `SortMode` | Order | Lighting |
+|---|---|---|
+| `Default` | Depth order within each tile (unchanged) | Allowed |
+| `Stable` | Depth order with sticky bucket keys, so near-tied depths keep their order between frames. Not recommended: no measured benefit (docs/sorting-study.md) | Allowed |
+| `TileRayDepth` | Order by the peak depth along the ray through the tile center | Allowed |
+| `PixelWindow` | Per-pixel order through a window of 16 or 32 entries | Refused |
+| `Hybrid` | Tile-center ray order, refined per pixel by a window of 8 | Refused |
+| `Stochastic` | Order-independent stochastic coverage, averaged over frames | Refused |
+
+`SortSettings` fields. Every field is validated whatever the mode, so a bad
+value is caught when it is set.
+
+| Field | Type | Default | Used by | Accepted values |
+|---|---|---|---|---|
+| `mode` | `SortMode` | `Default` | all | `Default` to `Stochastic` |
+| `pixelWindow` | `uint32_t` | 16 | `PixelWindow` | 16 or 32 in `PixelWindow`; otherwise 8, 16 or 32 |
+| `stableBucketsPerOctave` | `uint32_t` | 1024 | `Stable` | 1 to 65536 |
+| `stableHysteresis` | `float` | 1.0 | `Stable` | Finite, 0 to 16 buckets |
+| `stochasticSamples` | `uint32_t` | 4 | `Stochastic` | 4 or 8 |
+| `temporalFrames` | `uint32_t` | 32 | `Stochastic` | 1 to 4096 |
+| `temporalMode` | `uint32_t` | 0 | `Stochastic` | 0 (running mean, restart on motion) or 1 (running mean floored at `temporalEmaWeight`) |
+| `temporalEmaWeight` | `float` | 0.2 | `Stochastic` | Finite, in (0, 1] |
+
+The struct is 32 bytes with no padding. `validateSortSettings()` throws
+`std::invalid_argument` and names the field. The helpers are:
+
+| Helper | Returns |
+|---|---|
+| `sortModeName(mode)` | `"default"`, `"stable"`, `"tile-ray-depth"`, `"pixel-window"`, `"hybrid"` or `"stochastic"` |
+| `sortModeIncompatibleWithLighting(mode)` | `true` for `PixelWindow`, `Hybrid` and `Stochastic` |
+
+`ForwardStageTimings` holds the GPU time in milliseconds of each stage of one
+forward: `project`, `scan`, `binning`, `sortKeys`, `sort`, `ranges`,
+`rasterize`, `resolve` and `total`, with a `valid` flag. Every time is NaN when
+`valid` is `false`.
+
+The `Renderer` methods are:
+
+| Method | Behavior |
+|---|---|
+| `setSortSettings(const SortSettings &)` | Validates and stores the settings. Throws `std::invalid_argument` naming the field, and nothing changes. |
+| `sortSettings()` | The stored settings. |
+| `setStageTimingEnabled(bool)` | Off by default. While off, a forward adds no timestamp commands. |
+| `lastStageTimings()` | The times of the last `forward()`. All NaN with `valid` false when timing is off, unsupported, or the forward did not stamp (a capacity re-run, or no forward yet). |
+
+The rules:
+
+- The settings apply to `RenderMode::Viewer` only. A `Differentiable` forward
+  always uses `Default`, whatever is set, so `backward()` is unaffected.
+- With lighting on, a `Viewer` `forward()` throws `std::runtime_error` for
+  `PixelWindow`, `Hybrid` and `Stochastic`. They change the color order but
+  not the relight G-buffer. A `Differentiable` forward is never refused, since
+  it uses `Default`.
+- A new scene resets the `Stable` keys and the `Stochastic` history.
+  `Stochastic` also restarts when its settings change.
+
+```cpp
+sabercat::SortSettings sort;
+sort.mode = sabercat::SortMode::PixelWindow;
+sort.pixelWindow = 32;
+renderer.setSortSettings(sort);                  // throws std::invalid_argument on a bad value
+
+renderer.setStageTimingEnabled(true);
+renderer.forward(sabercat::RenderMode::Viewer);
+const sabercat::ForwardStageTimings & t = renderer.lastStageTimings();
+if (t.valid)
+{
+    std::printf("rasterize %.3f ms, total %.3f ms\n", t.rasterize, t.total);
+}
+```
+
+### ForwardPass (advanced)
+
+`Renderer` runs a `ForwardPass`, and the pass is public in
+`sabercat/forward_pass.h` for verification and study code. Its sort API
+matches the renderer's, with these additions:
+
+| Method | Behavior |
+|---|---|
+| `setSortSettings()`, `sortSettings()` | As on `Renderer`, for the next `run()` in `Viewer` mode. |
+| `setStageTimingEnabled()`, `stageTimingEnabled()`, `lastStageTimings()` | Timing for `run()`. The times are valid only when the run reached `ForwardStage::Rasterize` and had no capacity re-run. |
+| `computeRayDepthForm(views, camera)` | Computes the ray-depth form for `views.gaussianCount` Gaussians in a standalone submission. `camera.gaussianCount` must match it. The kernel is built on first use. Nothing a `run()` recorded is changed. |
+| `rayDepthForm()` | The form from the last `computeRayDepthForm()`, or from the last `run()` in `TileRayDepth`, `PixelWindow`, `Hybrid` or `Stochastic`. Throws `std::runtime_error` if neither has run. It holds 12 floats (48 B) per Gaussian. |
+| `stableKeys()` | `Stable`'s sticky keys, one `uint` per Gaussian. Throws `std::runtime_error` before a `Stable` run. |
+| `resetStableSort()` | The next `Stable` run starts the keys over. |
+| `resetStochastic()` | The next `Stochastic` run starts at noise frame 0 and is a raw frame. |
+| `lastStochasticFrame()`, `lastStochasticAccumulated()`, `lastStochasticWeight()` | The noise frame, the accumulated count and the history weight of the last completed `Stochastic` run. `lastStochasticAccumulated()` is 1 right after a reset. |
+| `extraBufferBytes()` | The allocated size of the mode buffers: sticky keys, the ray-depth form, and the `Stochastic` noise, parameters and history. |
+
+```cpp
+sabercat::SortSettings sort;
+sort.mode = sabercat::SortMode::Stochastic;
+sort.stochasticSamples = 8;
+sort.temporalFrames = 64;
+pass.setSortSettings(sort);
+pass.resetStochastic();
+pass.run(views, camera);                         // views and camera as for run()
+const uint32_t frame = pass.lastStochasticFrame();
+const std::vector<glm::vec4> image = pass.downloadOutputImage();
+```
+
+No C ABI change was made with these additions. `c_api.h` has no sort or
+timing calls, so the C API is the same as before.
 
 ## Relighting
 
@@ -520,6 +682,7 @@ per-format decisions, including what is rejected, are in
 |---|---|
 | Binary `.ply` (3DGS, with R3DG attributes when relight streams exist) | `PLYWriter::write(cloud, path)` |
 | `.glb` with one node per layer | `GLTFWriter::writeGLB(layers, path)` |
+| `.spz` (quantized; version 3 by default) | `SPZWriter::write(cloud, path, version)` |
 | cloud-v1 directory | `CloudV1Writer::write(cloud, directory)` |
 | cloud-v1 in memory | `CloudV1Writer::encode(cloud)` returns a `FileMap` |
 | relight sidecar (`sabercat.relight-v1`) | `RelightSidecar::encode(cloud)` and `RelightSidecar::decode(files, cloud, label)` |
@@ -530,6 +693,13 @@ host copy was dropped must call `downloadFromGPU()` first.
 `GLTFWriter::writeGLB()` takes `GLTFExportLayer` entries, each with a
 `cloud`, a `LayerTransform` and a name. The output extension is
 `KHR_gaussian_splatting`. Relight streams are not exported to glTF.
+
+`SPZWriter::write()` writes one cloud as a `.spz` file, the inverse of
+`SpzReader::read()`. The container is version 3 (gzip) unless `version` says
+otherwise; version 4 (zstd) is also accepted. Positions must lie within about
++-2048, or the call throws. Other values are quantized and clamped, and the
+call throws on a non-finite value. The rules are in
+[formats.md](formats.md#spz-export).
 
 ## Projects
 
@@ -592,7 +762,300 @@ Two functions apply placements to host data. Neither does GPU work.
 
 Call `computeBounds()` on the result before using its bounds.
 
-## Borrowed buffers
+## GPU layer merge and edits
+
+Studio edits layers on the GPU and merges them there. The calls in this section
+are the library side of that: the merge of GPU-resident layers into the
+renderer's scene, the edit kernels, and the bounds and highlight the renderer
+shows. The host `mergeLayers()` above still builds a host copy.
+
+Every call here is a synchronous submission on the renderer's submit queue. See
+[Synchronization of edits](#synchronization-of-edits).
+
+### Renderer::mergeLayersOnGpu
+
+```cpp
+void mergeLayersOnGpu(
+    const std::vector<std::pair<const sabercat::GaussianCloud *, sabercat::LayerTransform>> & layers);
+```
+
+Replaces the scene with the merge of GPU-resident layers, each placed by its
+transform. The merge reads the layers' GPU streams, owned or borrowed, and not
+their host copies. The rules are those of the host `mergeLayers()`:
+
+- The SH degree is the maximum of the layers' degrees.
+- The scene is antialiased only if every layer is.
+- A relight stream is kept only if every layer has it. A stream that some layers
+  have and others lack is dropped, with one warning per stream.
+- Every transform is validated.
+
+Storage: the merge writes in place when the current scene is owned, has
+capacity for the merged count and carries exactly the merged relight streams.
+Then `storageGeneration()` does not change and `gaussianCount()` becomes the
+merged count. Otherwise the merged scene gets new buffers and
+`storageGeneration()` advances. The new buffers are installed only after the
+merge succeeds.
+
+The merged scene has no host copy, so `sceneBounds()` is invalid until
+`setSceneBounds()` sets it. The renderer records the merge as a scene edit, so
+cached shadows are recomputed. When the merge keeps the Gaussian count and the
+layout, the acceleration structure is refit on the next shadowed frame instead of
+rebuilt. The renderer refits up to 16 times in a row and then rebuilds
+(`ShadowFrameStats::accelerationRefits`). Any selection highlight is dropped, so
+call `setSelectionHighlight()` again after the merge.
+
+Afterwards `readImage()`, `readLitImage()`, `imageView()` and the debug views
+throw until the next `forward()`.
+
+Errors, all `std::runtime_error`: an empty list, a null layer, a layer without
+GPU parameters, an invalid transform, and a layer that is the renderer's current
+scene. A throw before the merge starts leaves the current scene in place. A throw
+partway through an in-place merge leaves the scene partly merged, and the
+renderer still records the change.
+
+```cpp
+std::vector<std::pair<const sabercat::GaussianCloud *, sabercat::LayerTransform>> layers = {
+    {&base, sabercat::LayerTransform{}},
+    {&prop, placement},
+};
+renderer.mergeLayersOnGpu(layers);
+renderer.setSceneBounds(sabercat::mergedLayerBounds(layers));
+```
+
+`mergedLayerBounds()` reads host positions. For a layer that exists only on the
+GPU, call `downloadFromGPU()` on it first.
+
+### Renderer::setSceneBounds and mergedLayerBounds
+
+```cpp
+void setSceneBounds(const SceneBounds & bounds);
+
+// sabercat/layer_transform.h
+SceneBounds mergedLayerBounds(
+    const std::vector<std::pair<const GaussianCloud *, LayerTransform>> & layers);
+```
+
+`setSceneBounds()` sets the bounds of the current scene: the exact bounds from
+`mergedLayerBounds()` after a merge, or the caller's own. Shadows that take their
+focus from the bounds (`ShadowSettings::focusRadius <= 0`) are recomputed when
+the bounds change. It throws without a scene.
+
+`mergedLayerBounds()` returns the bounds that `mergeLayers()` would give, without
+building the merged cloud. It uses the host positions, transformed the way the
+bake transforms them, so the result equals the host bake of the same layers. An
+empty list gives `SceneBounds{}`. It throws `std::runtime_error` for a null layer,
+an invalid transform, or a layer whose host positions are not sized to its
+count.
+
+### Renderer::setSelectionHighlight and HighlightSettings
+
+```cpp
+void setSelectionHighlight(const std::vector<BufferView> & layerMasks,
+                           const HighlightSettings & settings);
+
+// sabercat/highlight_settings.h
+struct HighlightSettings
+{
+    uint32_t enabled = 0;                          // 0 = off (the default)
+    float tint[4] = {1.0f, 0.55f, 0.0f, 0.5f};     // rgb (display sRGB), blend weight a
+};
+```
+
+Tints the selected Gaussians of the scene the last `mergeLayersOnGpu()`
+produced. `layerMasks` holds the `SelectionMask::view()` of each layer, in the
+order the layers were merged. Each layer's bits are gathered into one merged mask
+on the GPU. That mask is a snapshot, so call this again after the selection
+changes.
+
+- With `settings.enabled == 0` the highlight is cleared, and `layerMasks` may be
+  empty.
+- While enabled, `forward(RenderMode::Viewer)` moves each selected Gaussian's
+  color toward `tint[0..2]` by `tint[3]`, right after projection. Only the color
+  changes.
+- The tint shows in the unlit color image (`readImage()`, `present()`, and
+  `DebugView::Final`). It does not show in the lit image. `RenderMode::Differentiable`
+  ignores it.
+- Any scene change disables the highlight, including a merge.
+- Like any change of the visible image, it ends the rendered frame:
+  `readImage()` and the debug views throw until the next `forward()`.
+
+Errors: `std::invalid_argument` when the number of masks is not the number of
+layers in the last merge. `std::runtime_error` when there is no scene, or the
+scene is not a merge result (or a scene change has ended its layer ranges).
+
+`HighlightSettings` is 20 bytes with no padding.
+
+### Renderer::lastForwardCamera
+
+```cpp
+CameraUniforms lastForwardCamera() const;
+```
+
+The camera uniforms that the last completed `forward()` of the current scene
+pushed: the up-axis flip, the intrinsics and the rasterizer's flag bits, exactly
+as the rasterizer saw them. `EditPass::select()` uses it for a Rectangle
+selection, so the rectangle matches the image the user sees. It throws
+`std::runtime_error` when there is no completed `forward()` of the current scene.
+A scene change ends it, so call `forward()` again.
+
+### Renderer::editPass and EditPass
+
+```cpp
+EditPass & editPass();
+```
+
+The renderer's edit kernels, created on the first call. They need a shader
+directory (`initialize()` with one). The object is destroyed by `shutdown()`.
+Do not construct an `EditPass` yourself.
+
+Every method below is synchronous. Each GPU step is one `Device::immediateSubmit`.
+Every precondition is checked before the first GPU step, so a throw leaves the
+layer and the mask as they were. Errors are `std::runtime_error` unless noted.
+
+Layer merge and selection:
+
+| Call | Semantics | Errors |
+|---|---|---|
+| `uint32_t exclusiveScan(const BufferView & input, const BufferView & output, uint32_t count, uint32_t inputStrideUints = 1, uint32_t inputOffsetUints = 0)` | Exclusive prefix sum of `count` uints read from `input` (element stride and offset as given), written to `output`. Returns the total. `count == 0` returns 0. Runs the library's `GpuScan`. | Views not at offset 0, the same buffer for both views, or a view too small. |
+| `void mergeLayers(const std::vector<MergeLayer> & layers, GaussianCloud & destination)` | Bakes `layers` into the destination's GPU streams, in order, on the GPU. The same placement math as the host `mergeLayers()`. Writes only the streams the destination has. Does not set the destination's SH degree, antialiased flag or bounds. | The destination has no GPU parameters, its count is not `planLayerMerge(layers).count`, it is one of the layers, or it has a relight stream that not every layer has. |
+| `void select(const GaussianCloud & layer, const LayerTransform & placement, const SelectionQuery & query, SelectionMask & mask)` | Evaluates the query's shape on each Gaussian's world-space mean (placed as the merge places it) and combines the result into `mask` by `query.op`. Bits at or beyond the layer's count stay zero. | The layer has no GPU parameters, the mask holds fewer than `count()` Gaussians, the placement is invalid, or a Rectangle has a camera with `fx` or `fy` not above zero. |
+| `void clearMask(SelectionMask & mask)` | Every word becomes 0. | None. |
+| `void selectAll(SelectionMask & mask, uint32_t count)` | Sets bits `[0, count)`, clears the rest. | None. |
+| `void invertMask(SelectionMask & mask, uint32_t count)` | Flips the bits below `count`. Bits at or beyond `count` stay 0. | None. |
+| `uint32_t countSelected(const SelectionMask & mask, uint32_t count)` | Number of set bits among the first `count` Gaussians. Partial counts are summed on the host in 64 bits. | `count` exceeds the mask's capacity. |
+| `MaskCentroid maskedCentroid(const GaussianCloud & layer, const SelectionMask & mask)` | Centroid of the selected Gaussians, in the layer's local space (the host applies the placement, in double). `count` 0 and a zero centroid when nothing is selected. | The mask holds fewer than `layer.count()` Gaussians. |
+| `void expandMaskToFlags(const SelectionMask & mask, uint32_t count, bool keepUnselected, const BufferView & flags)` | `flags[i]` is 1 for a selected Gaussian, or 0. With `keepUnselected` the values are inverted. | `flags` holds fewer than `count` uints, is not at offset 0, or is not a storage buffer. |
+| `GpuScan & scan()` | The internal scan object. It is not part of the installed API. Use `exclusiveScan()`. | None. |
+
+Stream edits. A layer whose parameters are borrowed is refused by the copying
+operations (`gatherSelected`, `scatterSnapshot`, `deleteSelected`, `undoDelete`,
+`duplicateSelected`, `undoDuplicate`). `transformSelected` and `select` accept
+borrowed layers.
+
+| Call | Semantics | Errors |
+|---|---|---|
+| `SparseSnapshot gatherSelected(const GaussianCloud & layer, const SelectionMask & mask, SnapshotScope scope)` | Host copy of the selected Gaussians, in ascending index order. `Transform` copies indices, means, scales, rotations, SH and normals (when present). `Full` copies every stream the layer has. | Borrowed layer; the mask holds fewer than `count()` Gaussians. |
+| `void scatterSnapshot(GaussianCloud & layer, const SparseSnapshot & snapshot)` | Writes the snapshot's non-empty streams back at its indices. The words are copied, not recomputed. An empty snapshot does nothing. | Borrowed layer; an index not below `count()`; a stream that does not exist on the layer or has a different element count. |
+| `void transformSelected(GaussianCloud & layer, const SelectionMask & mask, const LayerTransform & layerSpace)` | Applies a layer-space similarity to the selected Gaussians, in place, with the merge's math. The identity does nothing. Nothing selected is allowed. | The placement is invalid. |
+| `DeleteRecord deleteSelected(GaussianCloud & layer, SelectionMask & mask, const BufferView * remapOut = nullptr)` | Removes the selected Gaussians and compacts every stream. The kept Gaussians keep their order, and the selection is cleared. With `remapOut`, it receives one uint per old index: the new index, or `0xFFFFFFFF` for a deleted one. | Borrowed layer; every Gaussian selected (`std::invalid_argument`: remove the layer instead); `remapOut` is not a storage buffer at offset 0 of at least `oldCount * 4` bytes. Nothing selected returns a record with `deleted.count() == 0` and changes nothing. |
+| `void undoDelete(GaussianCloud & layer, SelectionMask & mask, const DeleteRecord & record)` | Restores the deleted Gaussians in their original order, and the selection, bit for bit. Redo is `deleteSelected()` again after restoring the selection. | Borrowed layer; `count()` is not `record.keptCount`; the capacity is below `record.oldCount`. A record with no deleted Gaussians does nothing. |
+| `DuplicateRecord duplicateSelected(GaussianCloud & layer, SelectionMask & mask)` | Appends a copy of every selected Gaussian after the last one. It grows the layer (to `max(needed, 1.5 x capacity)`) and the mask when needed. The copies become the selection. The record holds the selection from before the copy. Nothing selected returns a no-op record. | Borrowed layer. |
+| `void undoDuplicate(GaussianCloud & layer, SelectionMask & mask, const DuplicateRecord & record)` | Drops the appended Gaussians (the capacity is kept) and restores the selection. | Borrowed layer; `count()` is not `oldCount + added`. A record with `added == 0` does nothing. |
+
+Types used above:
+
+- `MergeLayer` is `std::pair<const GaussianCloud *, LayerTransform>`.
+- `MergedLayout planLayerMerge(const std::vector<MergeLayer> & layers)` gives the
+  count, SH degree, antialiased flag and relight presence that a merge of
+  `layers` would produce. It does no GPU work. It warns once per dropped
+  relight stream and throws `std::runtime_error` for an empty list, a null cloud,
+  a cloud without GPU parameters, or an invalid transform.
+- `SelectionQuery` holds the shape (`SelectShape::Box`, `Sphere` or `Rectangle`),
+  the operation (`SelectOp::Replace`, `Add` or `Subtract`), and the box, sphere
+  or rectangle fields. A rectangle is `rect` (x0, y0, x1, y1, in framebuffer
+  pixels) with the camera from `lastForwardCamera()`. It is 232 bytes.
+- `SparseSnapshot` holds the streams of the selected Gaussians, with `indices` in
+  ascending order. `bytes()` is its host memory.
+- `DeleteRecord` holds the `Full` snapshot of the deleted Gaussians, the selection
+  words, and the old and kept counts. `DuplicateRecord` holds the selection words,
+  the old count and the number added.
+
+### SelectionMask
+
+```cpp
+SelectionMask(Device & device, size_t capacity);   // capacity >= 1
+size_t capacity() const;
+size_t wordCount() const;
+const Buffer & buffer() const;
+BufferView view() const;                          // stride 4, whole buffer
+void resize(size_t newCapacity);
+std::vector<uint32_t> download(size_t count) const;
+void upload(const std::vector<uint32_t> & words);
+```
+
+One bit per Gaussian, packed in uint32 words (bit `i & 31` of word `i >> 5`).
+The mask is sized to the layer's capacity, and bits at or beyond the count are
+always zero. The constructor allocates `max(1, ceil(capacity / 32))` zeroed
+words. `resize()` keeps the contents and zeroes the new words, and it does
+nothing when the request is not larger. Growth can replace the buffer, so fetch
+`buffer()` and `view()` again afterwards. `download(count)` returns
+`ceil(count / 32)` words and needs `count <= capacity()`. `upload()` replaces the
+words and zeroes the rest.
+
+Errors: `upload()` throws `std::runtime_error` when `words` is longer than
+`wordCount()`. The class is not copyable.
+
+### edit_math
+
+GPU-free double-precision math, in `sabercat/edit_math.h`:
+
+| Call | Semantics | Errors |
+|---|---|---|
+| `struct Similarity { glm::dmat3 rotation; glm::dvec3 translation; double scale; glm::dvec3 apply(const glm::dvec3 & x) const; }` | `scale * rotation * x + translation`. | None. |
+| `Similarity compose(const Similarity & a, const Similarity & b)` | `a` after `b`. | None. |
+| `Similarity inverse(const Similarity & s)` | The inverse. | `std::invalid_argument` unless `scale > 0`. |
+| `Similarity similarityOf(const LayerTransform & placement)` | The placement as `T R S`, with the rotation normalized in double. | `std::invalid_argument` unless the scale is positive and the quaternion is non-zero and finite. |
+| `Similarity worldEditAboutPivot(const glm::dmat3 & rotation, double scale, const glm::dvec3 & translation, const glm::dvec3 & pivot)` | `x' = scale * rotation * (x - pivot) + pivot + translation`. | None (no validation). |
+| `Similarity layerSpaceEditD(const Similarity & layer, const Similarity & worldEdit)` | The world edit expressed in the layer's own space, in double: `L^-1 o T o L`. | `std::invalid_argument` unless both scales are positive. |
+| `LayerTransform layerSpaceEdit(const LayerTransform & layerPlacement, const Similarity & worldEdit)` | `layerSpaceEditD()` cast once to the float `LayerTransform`. | `std::invalid_argument` unless both scales are positive. |
+| `glm::vec4 normalizeRect(const glm::vec2 & a, const glm::vec2 & b)` | The rectangle spanned by a drag, as (x0, y0, x1, y1) with x0 <= x1 and y0 <= y1. | None. |
+| `bool boxContains(const glm::dvec3 & p, const glm::dvec3 & center, const glm::dvec3 & halfExtents, const glm::dmat3 & axes)` | True when `|dot(axes[i], p - center)| <= halfExtents[i]` for each axis. The axes are assumed orthonormal. | None. |
+| `bool sphereContains(const glm::dvec3 & p, const glm::dvec3 & center, double radius)` | True when `|p - center| <= radius`. | None. False for a negative radius. |
+| `bool projectToPixels(const glm::dvec3 & p, const CameraUniforms & camera, glm::dvec2 & pixel, double & depth)` | Projects a world point as the forward pass does. Returns false, leaving the outputs untouched, for a point at or behind `kMinDepth` or a non-finite result. | None. |
+| `bool rectContains(const glm::dvec3 & p, const CameraUniforms & camera, const glm::vec4 & rect)` | `projectToPixels()` succeeds and the pixel lies in the rectangle, edges included. | None. |
+
+NaN is never contained, in any of the predicates.
+
+### GaussianCloud: allocateGPU, setBounds and downloadFromGPU
+
+```cpp
+void allocateGPU(size_t count, size_t capacity, const RelightPresence & presence);
+void setBounds(const SceneBounds & bounds);
+void downloadFromGPU();
+```
+
+`RelightPresence` is `{normals, baseColorRoughness, metallic, visibility}`, four
+flags. Its rule: the core streams are always allocated, and each relight stream
+only when its flag is set.
+
+- `allocateGPU()` allocates owned, uninitialized GPU storage for
+  `max(count, capacity)` Gaussians and no host data. The host vectors are
+  cleared and stay stale until `downloadFromGPU()`. It recreates the buffers
+  (`storageGeneration()` advances) and drops the gradient buffers. The bounds,
+  SH degree and antialiased flag are left as they are. Errors:
+  `std::runtime_error` when `count` is 0.
+- `setBounds()` sets the bounds of a cloud that has no host copy. The owner
+  computes exact or conservative bounds. Studio uses it for the GPU-merged scene.
+- `downloadFromGPU()` refreshes the host vectors from the GPU: the core streams,
+  the normals, the base color and roughness, the metallic values, and the
+  visibility, each relight stream only when its GPU stream exists. It throws
+  `std::runtime_error` when the cloud has not been uploaded or borrowed.
+
+### ShadowFrameStats: acceleration refits
+
+`ShadowFrameStats` (in `sabercat/lighting.h`, 32 bytes, no padding) has two new
+fields:
+
+- `accelerationRefits`: how many times the acceleration structure was refit in
+  this frame. A refit replaces a rebuild after a merge that kept the Gaussian count
+  and layout.
+- `accelerationRefitsSinceBuild`: refits applied to the shared structure since its
+  last full build, after this frame. The structure is rebuilt at 16.
+
+### Synchronization of edits
+
+- Every `EditPass` call and every `mergeLayersOnGpu()` is a synchronous
+  submission on the renderer's submit queue. Each submission is bracketed by
+  `Device::recordGlobalBarrier()`. So no frame is ever in flight over a buffer
+  that is being compacted, and a compacted buffer is visible to the next frame.
+  The contract in [Ownership and synchronization](#ownership-and-synchronization)
+  applies unchanged.
+- An edit can replace a layer's buffers, when a duplicate grows it or
+  `allocateGPU()` allocates it. Views taken earlier are then stale, and
+  `storageGeneration()` shows it. Each `EditPass` call takes its views at dispatch
+  time, so a reserve made by an earlier call is always seen.
+- Borrowed layers are refused by the copying operations, as listed above. A
+  borrowed layer can still be merged, selected and transformed in place.
 
 Borrowing lets your application own the buffers that hold the scene.
 Sabercat renders and differentiates them in place. It never allocates, frees,
@@ -709,6 +1172,9 @@ buffers. It is the rule set for both owned and borrowed devices.
   changes only when the image is resized. Its contents are valid from
   `forward()` returning until the next `forward()`. `depthView()` follows the
   same rules.
+- **Debug view.** `renderDebugView()` returns one reused buffer. Its handle is
+  stable and changes only on a resize. Its contents are valid until the next
+  `renderDebugView()` or `readDebugView()` call, or the next resize.
 - **Borrowed device.** `computeQueue()` is the queue you lent. If you lent only
   a graphics queue, that queue is used.
 

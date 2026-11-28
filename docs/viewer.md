@@ -5,7 +5,7 @@ loads a scene, lets you move the camera, and shows the scene with the
 renderer's debug views and lighting.
 
 The viewer is a test and inspection tool. It is not an editor. To combine
-layers or export a scene, use [Sabercat Studio](studio.md).
+layers, edit Gaussians or export a scene, use [Sabercat Studio](studio.md).
 
 ## Start the viewer
 
@@ -53,7 +53,7 @@ The viewer draws the scene full screen. Three windows sit on top of it.
 |--------|----------|
 | Sabercat Debug | Scene list, file path, debug views, camera, rendering options and LOD |
 | Relight | Lighting, shadows, lights and baked visibility. See [Relight window](#relight-window). |
-| About Sabercat | The logo, version, license, third-party notices, the log file, and the **Copy system info** and **Open logs folder** buttons. Opened from **Help > About**. |
+| About Sabercat | The logo, version, license, third-party notices, the log file, and the **Copy system info** and **Open logs folder** buttons. Opened with the **About** button in the Sabercat Debug window. |
 
 The window title shows the version, with the pre-release suffix when the
 build has one (for example `Sabercat Viewer 1.0.0-beta.1`). The debug window
@@ -66,7 +66,7 @@ Each run writes a log file to `%LOCALAPPDATA%\Sabercat\logs`, named
 ones are deleted at start-up. Every line the console shows also goes to the file.
 Use `--log <path>` to write to another file, or `--no-log` to write none.
 
-**Help > About > Copy system info** puts a plain-text block on the clipboard:
+**About > Copy system info** puts a plain-text block on the clipboard:
 the version and git commit, the build configuration, the Windows version, the
 GPU, its driver and Vulkan version, ray query and float atomics support, the
 validation state and the log file path. Paste it into a bug report together
@@ -163,6 +163,29 @@ the same views.
 
 The **Tile instances** line shows how many tile entries the last frame used,
 out of the scene's Gaussian count.
+
+### Sort mode
+
+The **Sort mode** list in the Sabercat Debug window chooses the order in which
+each tile's Gaussians are blended. `Default` is the shipped order and the
+start-up choice. The other entries are opt-in and apply to Viewer runs only.
+
+| Entry | Settings shown |
+|-------|----------------|
+| Default | None. Depth-sorted blending. |
+| Stable (sticky keys, not recommended) | **Buckets per octave** (64 to 4096) and **Hysteresis (buckets)** (0 to 8). |
+| Tile ray depth | None. |
+| Pixel window | **16 px** or **32 px**. |
+| Hybrid (ray depth + window 8) | None. The window is fixed at 8 px. |
+| Stochastic | **Samples** (4 or 8), **Accumulation frames** (1 to 256) and **Temporal mode**. **EMA weight** (0.02 to 1.0) appears for Exponential average. |
+
+With **Relight** on, Pixel window, Hybrid and Stochastic are disabled in the
+list, and hovering over them shows "needs Relight off". **Show stage timings**
+adds a table of the GPU time of each forward stage for the last frame. A new
+scene resets the Stable keys and the Stochastic history.
+
+The measurements behind these modes are in [sorting-study.md](sorting-study.md).
+The rules for each mode are in [architecture.md](architecture.md#sort-modes).
 
 ## Level of detail
 

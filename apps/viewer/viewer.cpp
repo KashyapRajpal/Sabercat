@@ -47,6 +47,7 @@
 #include "sabercat/logger.h"
 #include "sabercat/renderer.h"
 #include "sabercat/scene_loader.h"
+#include "sabercat/sort_settings.h"
 #include "sabercat/version.h"
 #include "sabercat/vk_check.h"
 
@@ -72,6 +73,25 @@ std::string sceneFileLabel(const std::string & path)
     const size_t lastSlash = path.find_last_of("/\\");
     return (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 }
+
+// Labels and one-line notes for the Sort mode panel, indexed by SortMode.
+constexpr size_t kSortModeCount = static_cast<size_t>(SortMode::Stochastic) + 1;
+constexpr const char * kSortModeLabels[kSortModeCount] = {
+    "Default",
+    "Stable (sticky keys, not recommended)",
+    "Tile ray depth",
+    "Pixel window",
+    "Hybrid (ray depth + window 8)",
+    "Stochastic",
+};
+constexpr const char * kSortModeNotes[kSortModeCount] = {
+    "Depth-sorted blending: the shipped path.",
+    "Sticky depth buckets with hysteresis. Not recommended: no measured benefit (see docs/sorting-study.md).",
+    "Sort keys rewritten from each tile's ray-depth form.",
+    "Per-pixel window blend (16 or 32 px). Viewer only, not with Relight.",
+    "Ray-depth keys with the per-pixel window at 8 px. Viewer only, not with Relight.",
+    "Noisy while moving; converges when the camera is still. Viewer only, not with Relight.",
+};
 
 int main(int argc, char * argv[])
 {
@@ -381,6 +401,26 @@ int main(int argc, char * argv[])
         // threshold, while a Gaussian keeps its full top band for the first
         // half of the step.
         lodParams.appearanceFadeWidth = 0.5f;
+
+        // Sort mode panel state. The panel re-reads renderer.sortSettings() every
+        // frame, so it always shows what the renderer holds. sortError keeps the
+        // last refusal from setSortSettings on screen until a change goes through.
+        std::string sortError;
+        bool stageTimings = false;
+        // Applies settings to the renderer. A refused value (std::invalid_argument)
+        // leaves the renderer unchanged and is shown in the panel instead.
+        const auto applySortSettings = [&renderer, &sortError](const SortSettings & settings)
+        {
+            try
+            {
+                renderer.setSortSettings(settings);
+                sortError.clear();
+            }
+            catch (const std::invalid_argument & e)
+            {
+                sortError = e.what();
+            }
+        };
 
         Logger::info("Viewer frame limit: "
                      + (maxFps > 0.0 ? std::to_string(maxFps) + " FPS" : "unlimited"));
@@ -743,9 +783,153 @@ int main(int argc, char * argv[])
                 lodParams.appearanceEnabled = appearanceLodEnabled ? 1u : 0u;
                 renderer.setLODParams(lodParams);
             }
+
+            // Sort mode. Default until the user picks another mode, so an
+            // untouched panel renders exactly as before.
+            ImGui::Separator();
+            const bool lighting = renderer.lightingEnabled();
+            SortSettings sortEdit = renderer.sortSettings();
+            bool sortChanged = false;
+            const size_t modeIndex = static_cast<size_t>(sortEdit.mode);
+            ImGui::Text("Sort mode:");
+            if (ImGui::BeginCombo("##sortMode", kSortModeLabels[modeIndex]))
+            {
+                for (size_t i = 0; i < kSortModeCount; ++i)
+                {
+                    const auto mode = static_cast<SortMode>(i);
+                    const bool incompatible = lighting && sortModeIncompatibleWithLighting(mode);
+                    ImGui::BeginDisabled(incompatible);
+                    if (ImGui::Selectable(kSortModeLabels[i], sortEdit.mode == mode)
+                        && sortEdit.mode != mode)
+                    {
+                        sortEdit.mode = mode;
+                        sortChanged = true;
+                    }
+                    ImGui::EndDisabled();
+                    if (incompatible && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    {
+                        ImGui::SetTooltip("needs Relight off");
+                    }
+                    if (sortEdit.mode == mode)
+                    {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("%s", kSortModeNotes[modeIndex]);
+            if (sortEdit.mode == SortMode::PixelWindow)
+            {
+                // Hybrid's window is fixed at 8, so it has no control.
+                if (ImGui::RadioButton("16 px", sortEdit.pixelWindow == 16)
+                    && sortEdit.pixelWindow != 16)
+                {
+                    sortEdit.pixelWindow = 16;
+                    sortChanged = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("32 px", sortEdit.pixelWindow == 32)
+                    && sortEdit.pixelWindow != 32)
+                {
+                    sortEdit.pixelWindow = 32;
+                    sortChanged = true;
+                }
+            }
+            else if (sortEdit.mode == SortMode::Stable)
+            {
+                int buckets = static_cast<int>(sortEdit.stableBucketsPerOctave);
+                if (ImGui::SliderInt("Buckets per octave", &buckets, 64, 4096))
+                {
+                    sortEdit.stableBucketsPerOctave = static_cast<uint32_t>(buckets);
+                    sortChanged = true;
+                }
+                sortChanged |= ImGui::SliderFloat("Hysteresis (buckets)", &sortEdit.stableHysteresis,
+                                                  0.0f, 8.0f);
+            }
+            else if (sortEdit.mode == SortMode::Stochastic)
+            {
+                int samplesIndex = (sortEdit.stochasticSamples == 8) ? 1 : 0;
+                const char * const sampleItems[] = {"4", "8"};
+                if (ImGui::Combo("Samples", &samplesIndex, sampleItems, IM_ARRAYSIZE(sampleItems)))
+                {
+                    sortEdit.stochasticSamples = (samplesIndex == 1) ? 8u : 4u;
+                    sortChanged = true;
+                }
+                int frames = static_cast<int>(sortEdit.temporalFrames);
+                if (ImGui::SliderInt("Accumulation frames", &frames, 1, 256))
+                {
+                    sortEdit.temporalFrames = static_cast<uint32_t>(frames);
+                    sortChanged = true;
+                }
+                int temporalIndex = static_cast<int>(sortEdit.temporalMode);
+                const char * const temporalItems[] = {"Accumulate while static", "Exponential average"};
+                if (ImGui::Combo("Temporal mode", &temporalIndex, temporalItems,
+                                 IM_ARRAYSIZE(temporalItems)))
+                {
+                    sortEdit.temporalMode = static_cast<uint32_t>(temporalIndex);
+                    sortChanged = true;
+                }
+                if (sortEdit.temporalMode == 1)
+                {
+                    sortChanged |= ImGui::SliderFloat("EMA weight", &sortEdit.temporalEmaWeight, 0.02f,
+                                                      1.0f);
+                }
+            }
+            if (sortChanged)
+            {
+                applySortSettings(sortEdit);
+            }
+            if (!sortError.empty())
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", sortError.c_str());
+            }
+            if (ImGui::Checkbox("Show stage timings", &stageTimings))
+            {
+                renderer.setStageTimingEnabled(stageTimings);
+            }
+            if (stageTimings && renderer.lastStageTimings().valid)
+            {
+                const ForwardStageTimings & timings = renderer.lastStageTimings();
+                if (ImGui::BeginTable("##stageTimings", 2,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
+                                          | ImGuiTableFlags_SizingFixedFit))
+                {
+                    ImGui::TableSetupColumn("Stage");
+                    ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableHeadersRow();
+                    const auto timingRow = [](const char * stage, float ms)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(stage);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%.3f", ms);
+                    };
+                    timingRow("Project", timings.project);
+                    timingRow("Scan", timings.scan);
+                    timingRow("Binning", timings.binning);
+                    timingRow("Sort keys", timings.sortKeys);
+                    timingRow("Sort", timings.sort);
+                    timingRow("Ranges", timings.ranges);
+                    timingRow("Rasterize", timings.rasterize);
+                    timingRow("Resolve", timings.resolve);
+                    timingRow("Total", timings.total);
+                    ImGui::EndTable();
+                }
+            }
             ImGui::End();
 
             drawRelightPanel(renderer, relight);
+            // The Relight panel sets lighting inside drawRelightPanel, after the
+            // sort section above was drawn. forward() throws for a mode that
+            // cannot be lit, so drop back to Default before it runs.
+            if (renderer.lightingEnabled()
+                && sortModeIncompatibleWithLighting(renderer.sortSettings().mode))
+            {
+                SortSettings reset = renderer.sortSettings();
+                reset.mode = SortMode::Default;
+                applySortSettings(reset);
+            }
             drawAboutWindow(aboutOpen, systemInfo, aboutLogo.texture());
 
             ImGui::Render();

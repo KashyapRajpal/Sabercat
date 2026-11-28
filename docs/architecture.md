@@ -23,14 +23,15 @@ Platform: Windows 10/11 x64, Vulkan 1.3, Visual Studio 2022.
 | `sabercat` | static library, `Sabercat::sabercat` | Renderer, passes, loaders, writers, project files |
 | `sabercat_c` | shared library, `Sabercat::sabercat_c` | C ABI over `Renderer` |
 | `sabercat_viewer` | `apps/viewer` | Viewer: window, orbit camera, ImGui panels |
-| `sabercat_studio` | `apps/studio` | Studio: layers, project files, export |
+| `sabercat_studio` | `apps/studio` | Studio: layers, editing, project files, export |
+| `sabercat_compare` | `apps/compare` | Comparer: PSNR, FLIP and HDR-FLIP on the command line, and a window for comparing images, scenes and videos |
 | `sabercat_shaders` | SPIR-V files | Compiles every `.slang` kernel with `slangc` |
-| `apps/common` | shared app code | Used by the viewer and Studio |
+| `apps/common` | shared app code | Used by the viewer, Studio and Compare |
 
 Layering:
 
 ```
-apps (viewer, studio)        window, input, ImGui; creates the surface
+apps (viewer, studio, compare)  window, input, ImGui; creates the surface
         | VkSurfaceKHR, device handles (app-owned or Sabercat-owned)
         v
 sabercat library             Device, Buffer, passes, loaders, writers
@@ -62,8 +63,9 @@ noted.
 | Compute plumbing | `shader_compiler.h`, `descriptor_set.h`, `pipeline.h`, `command_buffer.h` | `shader_compiler.cpp`, `descriptor_set.cpp`, `pipeline.cpp`, `command_buffer.cpp` |
 | Gaussian data | `gaussian_cloud.h`, `buffer_view.h`, `borrowed.h`, `scene_bounds.h`, `render_config.h` | `gaussian_cloud.cpp`, `borrowed.cpp` |
 | Loaders | `scene_loader.h`, `ply_reader.h`, `splat_reader.h`, `spz_reader.h`, `gltf_reader.h`, `ksplat_reader.h`, `sog_reader.h`, `cloud_v1_reader.h` | matching `.cpp` files |
-| Writers and projects | `ply_writer.h`, `gltf_writer.h`, `cloud_v1_writer.h`, `project.h`, `file_map.h`, `layer_transform.h` | matching `.cpp`, `zip_archive.{h,cpp}` (internal), `sh_rotation.{h,cpp}` (internal) |
-| Forward and backward | `forward_pass.h`, `backward_pass.h`, `debug_visualizer.h`, `camera.h` | `forward_pass.cpp`, `backward_pass.cpp`, `debug_visualizer.cpp` |
+| Writers and projects | `ply_writer.h`, `gltf_writer.h`, `spz_writer.h`, `cloud_v1_writer.h`, `project.h`, `file_map.h`, `layer_transform.h` | matching `.cpp`, `zip_archive.{h,cpp}` (internal), `sh_rotation.{h,cpp}` (internal) |
+| Forward and backward | `forward_pass.h`, `backward_pass.h`, `debug_visualizer.h`, `camera.h`, `sort_settings.h` | `forward_pass.cpp` (also holds `validateSortSettings()`), `backward_pass.cpp`, `debug_visualizer.cpp`, `gpu_scan.{h,cpp}` (internal), `blue_noise.{h,cpp}` (internal) |
+| Editing | `edit_pass.h`, `selection_mask.h`, `edit_math.h`, `highlight_settings.h` | `edit_pass.cpp`, `selection_mask.cpp`, `edit_math.cpp`, `highlight_pass.{h,cpp}` (internal) |
 | Lighting, shadows, bake | `lighting.h`, `relight_pass.h`, `shadow_pass.h`, `visibility_pass.h`, `gaussian_acceleration_structure.h` | `lighting.cpp`, `relight_pass.cpp`, `shadow_pass.cpp`, `visibility_pass.cpp`, `gaussian_acceleration_structure.cpp` |
 | Facade and C ABI | `renderer.h`, `c_api.h` | `renderer.cpp`, `src/api/c_api.cpp` |
 | Helpers | `parallel_for.h`, `approx.h`, `version.h.in` | none |
@@ -424,6 +426,143 @@ image that looks plausible but is wrong.
   `normalize(mean - cameraPosition)`. When the scene is flipped, the camera
   position is negated on the host, not the mean.
 
+### Sort modes
+
+The default sort is the one described above, and it is unchanged. Five other
+modes are opt-in and apply to Viewer runs only. A `Differentiable` run always
+uses `Default`, because the backward pass assumes that order. With `Default`
+the chain records none of the stages below.
+
+| Mode | Keys between binning and the radix sort | Rasterizer | After the rasterizer |
+| --- | --- | --- | --- |
+| `Default` | Unchanged | `tile_rasterize` | Nothing |
+| `Stable` | `sort_stable_update`, then `sort_stable_keys` rewrites the depth word | `tile_rasterize` | Nothing |
+| `TileRayDepth` | `ray_depth_form`, then `sort_tile_ray_keys` rewrites the depth word | `tile_rasterize` | Nothing |
+| `PixelWindow` | `ray_depth_form` only | `tile_rasterize_window_k16` or `_k32` | Nothing |
+| `Hybrid` | As `TileRayDepth` | `tile_rasterize_window_k8` | Nothing |
+| `Stochastic` | `ray_depth_form`. The four depth-word radix passes are skipped | `tile_rasterize_stochastic_s4` or `_s8` | `stochastic_resolve` |
+
+The key is a tile word and a depth word, and the radix sort orders by the tile
+word first. Each mode's stages go after the binning barrier and before the
+sort, so the radix sort itself runs unchanged for every mode except that
+Stochastic skips its depth-word passes. The window and stochastic rasterizers
+replace `tile_rasterize` and write only the color and depth images.
+
+**Stable (not recommended).** Each Gaussian keeps a sticky key: the bucket of `log2(depth)` it
+was last sorted with, with `stableBucketsPerOctave` buckets per octave. The
+depth is offset by 64 octaves so the value is never negative. The key is
+replaced only when the depth moves more than half a bucket plus
+`stableHysteresis` buckets from the center of the stored bucket. A Gaussian
+with no tiles gets the sentinel `0xFFFFFFFF`. Near-tied depths keep their
+order from frame to frame, where the default sort can flip them with rounding.
+The state is one `uint` per Gaussian. It is reset on a new scene, by
+`resetStableSort()`, on resize, on a change of the Gaussian count, and on a
+change of the Stable parameters or of entering or leaving the mode.
+
+**TileRayDepth.** The depth word becomes `t*`, the depth at which the
+Gaussian's density peaks along the ray through the tile center. The value is
+clamped to zero and stored as float bits, which sort like the values. Every
+pixel in a tile shares the list, so this is a tile-center order. A degenerate
+Gaussian, or one whose `t*` is not finite, uses its center depth.
+
+**Ray-depth form.** The modes that need `t*` compute the form every frame for
+the current camera. It holds 12 floats per Gaussian (48 B), laid out as the
+three columns of `P` followed by `u`, and is exposed as `rayDepthForm()`. With
+`P = S^-1 R^T W^T` (W is the upper-left 3x3 of the world-to-camera matrix, R
+comes from the normalized quaternion, S = diag(scale)) and `u = P mu_cam`, the
+peak along a ray `d = (dx, dy, -1)` is
+
+    d' = P d = c0 dx + c1 dy - c2
+    t* = dot(u, d') / dot(d', d')
+
+If `dot(d', d')` is not positive or `t*` is not finite, the Gaussian's center
+depth is used instead. A degenerate Gaussian (a non-finite mean or scale, a
+zero scale, or a zero-length quaternion) stores all zeros, which sends it to
+the center depth.
+
+The form is whitened: `P^T P` is the inverse covariance, and `P` and `u` are
+formed directly from the rotation and the inverse scales. An earlier 9-float
+form stored the inverse covariance B and `a = B mu`. That form measured a worst
+relative error of 2.8e-4 in fp32, because `a` cancels. The whitened form keeps
+the error at a few ulps.
+
+**PixelWindow and Hybrid.** The list keeps the default or the T1 order, and
+each pixel blends the tile's candidates through a window. The window holds at
+most K entries, sorted by `(t*, Gaussian index)`. When a contributor arrives
+and the window is full, the smallest entry is popped and blended, and then the
+arrival is inserted. When the list ends, the window is flushed in ascending
+order. A pixel whose transmittance drops below the early-out threshold stops
+at that point, and its window is not flushed. The window model has two limits:
+K = 1 gives the list order, which is the tile order, and K at least the number
+of contributors gives the exact ray-depth order. PixelWindow uses K = 16 or 32.
+Hybrid uses K = 8 on the T1 keys. The depth output is the center depth of the
+first entry blended.
+
+**Stochastic.** This mode trades exact per-frame order for an order-independent
+estimate. Each pixel keeps S samples (4 or 8), and each sample keeps one
+candidate:
+
+1. A candidate that contributes at the pixel covers sample s when its alpha is
+   greater than the sample's threshold. The threshold is the pixel's blue-noise
+   rank for that sample, plus a per-frame offset, plus a hash of the Gaussian
+   index and a seed from the frame and the sample, wrapped into [0, 1).
+2. A covered sample keeps the candidate with the smallest `t*` seen so far.
+   The comparison is strict, so the first candidate in the list wins a tie.
+3. There is no transmittance early-out, so the result does not depend on the
+   list order. The depth-word radix passes are skipped for the same reason.
+
+The rank table is a 64x64 blue-noise table, a permutation of 0..4095 built
+deterministically on the host and uploaded once (16 KB). The per-frame offset
+is the fractional part of `frame * 0.618...`. The frame index advances on each
+Stochastic run and restarts at zero on `resetStochastic()`.
+
+The raw frame holds the premultiplied color averaged over the samples, and its
+alpha is the number of covered samples over S. The resolve stage blends it into
+a per-pixel history, `history += (raw - history) * weight`, and writes the
+history out as the frame. The weight is set on the host for each run:
+
+- Static camera, `temporalMode` 0: `weight = 1/k`, a running mean.
+- Static camera, `temporalMode` 1: `weight = max(1/k, temporalEmaWeight)`, a
+  running mean that becomes an exponential average once `1/k` reaches the
+  floor.
+- Camera moved, `temporalMode` 0: the history restarts, `weight = 1`.
+- Camera moved, `temporalMode` 1: `weight = temporalEmaWeight`, with no restart.
+
+Here `k` counts the frames in the history, including the new one, and is
+capped at `temporalFrames`. A `temporalFrames` of 1 makes every frame a raw
+frame. The history is not reprojected: with motion it is restarted or blended,
+not moved to the new pixel positions. Averaged over frames, the samples
+converge to the front-to-back blend in `t*` order.
+
+**Stage timestamps.** With timing on (`setStageTimingEnabled()`), the chain
+writes timestamps at its stage boundaries: start, project, scan, binning,
+sort keys, sort, ranges, rasterize, and resolve. The form and key work falls in
+the sort-keys slot, the window or stochastic rasterizer in the rasterize slot,
+and the resolve dispatch in the resolve slot. The resolve slot is close to
+zero in the other modes. The times are valid only for a run that reached the
+rasterizer and had no capacity re-run.
+
+**Memory.** The buffers are added only in the modes that use them. They are
+reported by `ForwardPass::extraBufferBytes()`.
+
+| Mode | Per Gaussian | Per pixel | Fixed |
+| --- | --- | --- | --- |
+| `Default` | None | None | None |
+| `Stable` | 4 B (sticky key) | None | None |
+| `TileRayDepth`, `PixelWindow`, `Hybrid` | 48 B (ray-depth form) | None | None |
+| `Stochastic` | 48 B (ray-depth form) | 16 B (history, float4) | 16 KB noise table, 16 B parameters |
+
+**Lighting.** With lighting on, a Viewer `forward()` throws `std::runtime_error`
+for `PixelWindow`, `Hybrid` and `Stochastic`. Those modes change the color order
+but not the relight G-buffer, which is splatted in the default order, so the lit
+image would disagree with it. `Stable` and `TileRayDepth` change the sorted list
+itself, which the G-buffer also reads, so they are allowed. Differentiable runs
+are never refused, because they use `Default`.
+
+Measurements of the modes, and the CPU models they are checked against, are in
+[sorting-study.md](sorting-study.md). `examples/sort_modes_test` checks each
+mode against those models and checks that the default path is unchanged.
+
 ### Verification
 
 `examples/forward_test` runs each stage on a small synthetic cloud and compares
@@ -693,6 +832,51 @@ the memory model requires a visibility operation for device-to-device reads.
 `submitAndWait()` wraps each submission with the global barriers, the submit
 queue and one persistent fence. `ForwardPass` uses it for its single per-frame
 submission.
+
+### Edit kernels
+
+The Studio edits run as kernels in `EditPass` (`include/sabercat/edit_pass.h`,
+`src/renderer/edit_pass.cpp`). They work on each layer's own GPU buffers. Only
+`Renderer::mergeLayersOnGpu()` writes the renderer's scene. The kernels are in
+`shaders/`:
+
+| Shader | Used by | Work and notes |
+|---|---|---|
+| `layer_merge.slang` | `EditPass::mergeLayers()`, which `mergeLayersOnGpu()` calls | One dispatch per layer. Thread i reads source Gaussian i and writes destination Gaussian `first + i`. Layers write disjoint ranges, so no barrier separates the dispatches. Each layer has an identity path (a copy) and a similarity path. |
+| `edit_select.slang` | `EditPass::select()` | One thread per 32-Gaussian mask word. The thread reads its 32 Gaussians and writes its own word, so there are no atomics and the result is deterministic. The predicate is a box, a sphere or a rectangle. |
+| `edit_mask_ops.slang` | `clearMask()`, `selectAll()`, `invertMask()`, `countSelected()`, `maskedCentroid()`, `expandMaskToFlags()` | One kernel, with the operation as a mode in the push constants. Grid-stride loops. Count and centroid write one partial per workgroup, and the host adds the partials. |
+| `edit_compact.slang` | Delete and its undo, duplicate and its undo, the sparse snapshot and its restore | One generic word kernel. A stream is viewed as uint32 words, `wordsPerElement` per element: 4 for `vec4`, 64 for SH, 16 for visibility, 1 for scalars and for the index list. Modes: GATHER, INDEX, SCATTER, COMPACT, APPEND, EXPAND and REMAP. Grid-stride loops. |
+| `edit_transform.slang` | `EditPass::transformSelected()` | One invocation per Gaussian, in place. A selected Gaussian takes the similarity path of `layer_merge.slang` with the same parameters, so transforming a layer gives the same values as merging it with that placement. The identity is never dispatched. |
+| `selection_merge.slang` | `Renderer::setSelectionHighlight()` | Gathers each layer's mask bits into the merged mask, one dispatch per layer. Each thread owns one merged word. A word that straddles two layers is written by both dispatches, and a barrier between the dispatches orders them. The merged mask is zeroed first. |
+| `highlight_tint.slang` | Forward pass, viewer runs only | Runs after projection and before the tile-count scan. Moves the color of each selected Gaussian toward the tint. Depth, footprint, alpha and tile count are unchanged. |
+
+Shared headers:
+
+- `edit_common.slangh` holds the `SimilarityParams` block (480 bytes), the node
+  matrix and quaternion products, and the SH band rotation. It is the fp32 port
+  of the host bake (`bakeLayer()` and `rotateShCoefficients()`). `layer_merge.slang`
+  and `edit_transform.slang` include it.
+- `edit_select_common.slangh` holds the `SelectParams` block (256 bytes). The
+  host struct in `edit_pass.cpp` mirrors it byte for byte.
+
+The scan is shared. `EditPass::exclusiveScan()` and the compaction both use
+`GpuScan`, which runs `prefix_sum.slang`, the same shader as the forward pass's
+scans. The sequences are:
+
+- Delete: keep flags from `expandMaskToFlags()`, then an exclusive scan of them,
+  then one REMAP dispatch when a remap is requested, then one COMPACT per stream
+  into a scratch buffer. The scratch is copied back over the stream in the same
+  submission.
+- Undo of a delete: EXPAND from the record's kept Gaussians and deleted Gaussians.
+- Duplicate: selected flags, an exclusive scan, then APPEND.
+- Sparse snapshot: INDEX, then GATHER per stream. Its restore is SCATTER.
+
+**Compaction barrier.** Each `EditPass` step is one `Device::immediateSubmit`,
+which records `recordGlobalBarrier()` before and after the kernels. That is the
+compaction barrier. No frame is in flight over a buffer while it is being
+compacted, and a compacted buffer is visible to the next frame. Within a
+submission, the copy back over a stream waits on a compute-to-transfer barrier,
+so it copies the finished scratch.
 
 ---
 
@@ -1092,8 +1276,8 @@ produces.
 
 ## 16. Studio
 
-Studio (`apps/studio`, target `sabercat_studio`) edits layers and saves
-projects. It exports PLY and GLB.
+Studio (`apps/studio`, target `sabercat_studio`) edits layers and the Gaussians
+of the active layer, and saves projects. It exports PLY, GLB and SPZ.
 
 Studio is always an owner of its device (model B). It creates the instance and
 device through `BorrowedVulkanHost` (`apps/common`) and calls
@@ -1111,7 +1295,10 @@ B with `--borrowed`.
 | `zip::` (internal) | `src/renderer/zip_archive.{h,cpp}` | STORED writer. Reads STORED and DEFLATE entries and checks CRC. Not installed |
 | `PLYWriter` | `ply_writer.h` | Exact inverse of `PLYReader`. Writes R3DG attributes when relight streams exist |
 | `GLTFWriter` | `gltf_writer.h` | `KHR_gaussian_splatting` as one `.glb`, one mesh and one node per layer |
-| `LayerTransform`, `transformedCopy`, `mergeLayers` | `layer_transform.h` | Rigid placement with uniform scale, and a host-side merge of the visible layers |
+| `SPZWriter` | `spz_writer.h` | Exact inverse of `SpzReader`. Quantized `.spz`, container version 3 by default |
+| `LayerTransform`, `transformedCopy`, `mergeLayers`, `mergedLayerBounds` | `layer_transform.h` | Rigid placement with uniform scale, and a host-side merge of the visible layers. The merge is used for the PLY and SPZ exports and as the fallback for the GPU merge |
+| `EditPass`, `SelectionMask` | `edit_pass.h`, `selection_mask.h` | The edit kernels (see [Edit kernels](#edit-kernels)) and the per-Gaussian selection bits |
+| `StudioEdit`, `EditCommand`, `EditHistory` | `apps/studio/studio_edit.h`, `studio_edits.h`, `edit_history.h` | The selection masks and the transform preview, the undo and redo commands (one class per kind of edit), and the history with a byte budget (1 GiB by default). Each command holds what it needs to invert itself |
 | `sh_rotation` (internal) | `src/renderer/sh_rotation.{h,cpp}` | Rotates SH bands 1-3 for a layer rotation |
 | `apps/common` | `apps/common/` | Shared app code: window and ImGui, borrowed host, orbit camera, relight panel, asset scan, about panel |
 
@@ -1194,11 +1381,15 @@ Release, cluster "fly" XXL, 3,506,799 Gaussians, one layer:
 - When every layer is hidden the viewport is empty (Studio calls
   `Renderer::clearScene()`).
 - Loading reads the whole archive into memory.
-- No zip64. An archive over 4 GiB or with more than 65534 entries is refused
-  with an error.
+- The project file is written as Zip64 when it exceeds the classic limits
+  (an entry or the archive over 4 GiB, or more than 65534 entries).
 - The apps use the native Windows file dialogs, with a typed path as the
   fallback when a dialog cannot be shown.
-- Layer merge runs on the host.
+- Layers are merged on the GPU (`Renderer::mergeLayersOnGpu()`) at each scene
+  rebuild. The host merge runs for the PLY and SPZ exports and as the fallback
+  when the GPU merge fails.
+- An edited layer's GPU copy is ahead of its host copy until the next save or
+  export, which syncs it.
 
 ### Studio command line
 

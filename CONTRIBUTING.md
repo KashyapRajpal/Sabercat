@@ -33,7 +33,7 @@ Debug builds turn on the Vulkan validation layer. Keep it on while you work. A `
 
 ## Tests
 
-CTest runs two kinds of test. The `cpu` label (`tests/unit`) is CPU-only and runs in continuous integration. The `gpu` label is the GPU programs in `examples/*_test` plus `studio_selftest`, which need a Vulkan 1.3 GPU, so run them on your own machine:
+CTest runs two kinds of test. The `cpu` label (`tests/unit`) is CPU-only and runs in continuous integration. The `gpu` label is the GPU programs in `examples/` (`*_test` and `trainer_example`) plus `studio_selftest` and `compare_selftest`, which need a Vulkan 1.3 GPU, so run them on your own machine:
 
 ```powershell
 cmake --build build --config Release --parallel
@@ -51,7 +51,7 @@ Add a test for new behavior. A new GPU test is an `examples/<name>_test` program
 
 - **Language**: C++20. The C ABI in `include/sabercat/c_api.h` stays plain C-compatible.
 - **Formatting**: run `clang-format` with the `.clang-format` file at the repository root on the C++ files you change.
-- **License header**: new source files start with the same two-line SPDX header as the existing files (`// Copyright 2026 Kashyap Rajpal` and `// SPDX-License-Identifier: Apache-2.0`, or `#` comments in CMake, PowerShell and YAML).
+- **License header**: new source files start with the same two-line SPDX header as the existing files (`// Copyright 2026 Kashyap Rajpal` and `// SPDX-License-Identifier: Apache-2.0`, or `#` comments in CMake, PowerShell and YAML). CI enforces this (and also rejects committed secrets and absolute local paths) with `python tools/check_repo.py`, which you can run locally. `python tools/check_repo.py --self-test` runs the checker's own fixtures. CI also runs gitleaks over the full history, from a pinned and checksum-verified binary. A line may carry the marker `repo-check: allow` for an intentional literal, such as a test or a doc example.
 - **Naming**:
   - Types: `PascalCase`.
   - Functions and methods: `camelCase`.
